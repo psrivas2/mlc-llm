@@ -51,6 +51,12 @@ class LlamaConfig:
 MODEL_CONFIG = {
     "vicuna-v1-7b": {},
     "llama-7b": {},
+    "llama-30b": {
+        "hidden_size": 6656,
+        "intermediate_size": 17920,
+        "num_attention_heads": 52,
+        "num_hidden_layers": 60,
+    }
 }
 
 

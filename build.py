@@ -214,6 +214,7 @@ def mod_transform_before_build(
     model_names = ["encoding", "decoding", "create_kv_cache"]
 
     if not args.no_quantize:
+        debug_dump_script(mod, "mod_before_quantization.py", args)
         mod = mlc_llm.transform.GroupQuantize(
             group_size=40 if args.quantization_mode.endswith("3") else 32,
             sym=args.quantization_sym,
@@ -221,6 +222,8 @@ def mod_transform_before_build(
             storage_nbit=args.quantization_storage_nbit,
             dtype=args.dtype,
         )(mod)
+        debug_dump_script(mod, "mod_after_quantization.py", args)
+
     if args.target_kind == "cuda" and args.cutlass_offload:
         from tvm.relax.backend.contrib.cutlass import partition_for_cutlass
 
@@ -280,6 +283,7 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     ARGS = _parse_args()
+    print(ARGS)
     os.makedirs(ARGS.artifact_path, exist_ok=True)
     os.makedirs(os.path.join(ARGS.artifact_path, "debug"), exist_ok=True)
     cache_path = os.path.join(
