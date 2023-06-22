@@ -403,7 +403,7 @@ def main():
     use_cache = ARGS.use_cache and os.path.isfile(cache_path)
     with open(os.path.join(ARGS.model_path, "config.json"), encoding="utf-8") as i_f:
         config = json.load(i_f)
-        if True:
+        if not use_cache:
             if ARGS.model_category == "llama":
                 mod, params = llama.get_model(ARGS, config)
             elif ARGS.model_category == "gpt_neox":
@@ -414,6 +414,7 @@ def main():
                 mod, params = rwkv.get_model(ARGS, config)
             else:
                 raise ValueError(f"Model {ARGS.model} not supported")
+            debug_dump_script(mod, "mod_before_transformation_build.py", ARGS)
             mod = mod_transform_before_build(mod, params, ARGS)
             # print(mod.without_attr("external_mods").without_attr("const_name_to_constant"))
 

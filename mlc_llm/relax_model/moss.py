@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
-
+import numpy as np
 import tvm
 from tvm import relax, te
 from tvm.relax.op import (
@@ -221,19 +221,19 @@ class MossAttention(nn.Module):
             k = nn.emit(
                 relax.Call(
                     f_kv_cache_view,
-                    args=[k_cache, kv_cache_shape],
-                    sinfo_args=[R.Tensor(kv_cache_shape, k.struct_info.dtype)],
+                    args=[k_cache, kv_states_shape],
+                    sinfo_args=[R.Tensor(kv_states_shape, k.struct_info.dtype)],
                 )
             )
             v = nn.emit(
                 relax.Call(
                     f_kv_cache_view,
-                    args=[v_cache, kv_cache_shape],
-                    sinfo_args=[R.Tensor(kv_cache_shape, v.struct_info.dtype)],
+                    args=[v_cache, kv_states_shape],
+                    sinfo_args=[R.Tensor(kv_states_shape, v.struct_info.dtype)],
                 )
             )
-            k = nn.emit(reshape(k, kv_states_shape))
-            v = nn.emit(reshape(v, kv_states_shape))
+            # k = nn.emit(reshape(k, kv_states_shape))
+            # v = nn.emit(reshape(v, kv_states_shape))
             past_key_value = (k_cache, v_cache)
         else:
             past_key_value = (None, None)
@@ -580,15 +580,42 @@ def create_decoding_func(
     gv = mod.get_global_var("decode")
     bb.update_func(gv, mod[gv].with_attr("num_input", 3))
 
+def create_softmax_func(bb: relax.BlockBuilder, config: MossConfig) -> None:
+    with bb.function("softmax_with_temperature"):
+        logits = nn.Placeholder(
+            (1, 1, config.vocab_size), dtype="float32", name="logits"
+        )
+        temperature = nn.Placeholder((), dtype="float32", name="temperature")
+        with bb.dataflow():
+            div = bb.emit(relax.op.divide(logits, temperature))
+            softmax = bb.emit(relax.op.nn.softmax(div, axis=-1))
+            gv = bb.emit_output(softmax)
+        bb.emit_func_output(gv, [logits, temperature])
+
+def adapt_hf_config(hf_config):
+    hf_config["hidden_size"] = hf_config["n_embd"]
+    hf_config["intermediate_size"] = 16384
+    hf_config["num_attention_heads"] = hf_config["n_head"]
+    hf_config["num_hidden_layers"] = hf_config["n_layer"]
+    hf_config["rotary_pct"] = 0.25
+    hf_config["hidden_act"] = hf_config["activation_function"]
+    hf_config["swizzle_style"] = "gptj"
+    # hack to get embedding quantization working
+    # increase vocab_size to multiple of 64
+    hf_config["vocab_size"] = ((hf_config["vocab_size"] + 63) // 64) * 64
+    return hf_config
+    
 
 def get_model(args, hf_config):
     from transformers import AutoModelForCausalLM  # type: ignore[import]
 
     model_name = args.model
     model_path = args.model_path
-    dtype = args.quantization.dtype
+    dtype = args.quantization.model_dtype
     max_seq_len = args.max_seq_len
-
+    # The parameter names from MossConfig do not match GPTJ family config.json from HF
+    # This function adapts it. Tested for GPTJ-6B only
+    hf_config = adapt_hf_config(hf_config)
     config = MossConfig(**hf_config, dtype=dtype)
     if max_seq_len != -1:
         config.max_sequence_length = max_seq_len
@@ -600,6 +627,13 @@ def get_model(args, hf_config):
 
     for name, param in hf_model.named_parameters():
         param = param.detach().cpu().numpy()
+        # As we increase vocab_size to be a multiple of 64, pad embedding
+        # and head layer params accordingly
+        if "wte" in name or "lm_head.weight" in name:
+            param = np.pad(param, ((0, config.vocab_size - param.shape[0]), (0,0)), mode='constant')
+        if "lm_head.bias" in name:
+            param = np.pad(param, ((0, config.vocab_size - param.shape[0]),), mode='constant')
+        
         if "ln_1" in name or "ln_f" in name:
             param = param.astype("float32")
         else:
@@ -618,10 +652,10 @@ def get_model(args, hf_config):
         else:
             param_list.append((name, param))
 
-        del hf_model
-        param_list = [
-            (name, tvm.nd.array(param, tvm.cpu())) for name, param in param_list
-        ]
+    del hf_model
+    param_list = [
+        (name, tvm.nd.array(param, tvm.cpu())) for name, param in param_list
+    ]
 
     bb = relax.BlockBuilder()
     create_encoding_func(bb, config, param_list)
@@ -634,6 +668,7 @@ def get_model(args, hf_config):
         stop_tokens=[106068],
         add_prefix_space=True,
     )
+    create_softmax_func(bb, config)
     mod = bb.get()
     for gv in mod.functions:
         func = mod[gv]

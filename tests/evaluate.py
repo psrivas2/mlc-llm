@@ -61,7 +61,7 @@ class LibCompare(LibCompareVMInstrument):
         if name.startswith("shape_func"):
             return
         if name not in self.time_eval_results:
-            super().compare(name, ref_args, new_args, ret_indices)
+            # super().compare(name, ref_args, new_args, ret_indices)
             res = self.mod.time_evaluator(name, dev=self.device)(*new_args).mean
             self.time_eval_results[name] = (res, 1)
         else:
@@ -133,11 +133,11 @@ def deploy_to_pipeline(args) -> None:
     )
     device.sync()
     end = time.time()
-    fcache_view = tvm.get_global_func("vm.builtin.attention_kv_cache_view")
-    first_k_cache = fcache_view(kv_caches[0], ShapeTuple([1, seqlen+1, 32, 128]))
-    if args.debug_dump:
-        print(f"output kv_cache[0]:\n{first_k_cache.numpy().transpose(1, 0, 2)}")
-        print(f"output logits:\n{logits.numpy()}")
+    # fcache_view = tvm.get_global_func("vm.builtin.attention_kv_cache_view")
+    # first_k_cache = fcache_view(kv_caches[0], ShapeTuple([1, seqlen+1, 32, 128]))
+    # if args.debug_dump:
+    #     print(f"output kv_cache[0]:\n{first_k_cache.numpy().transpose(1, 0, 2)}")
+    #     print(f"output logits:\n{logits.numpy()}")
     print(
         f"Time elapsed: encoding {(encoding_end - start)} seconds, decoding {end - encoding_end} secs"
     )
@@ -161,18 +161,18 @@ def deploy_to_pipeline(args) -> None:
         )
         cmp_instrument.time_eval_results.clear()
 
-        # logits, kv_caches = vm["decode"](
-        #     first_sampled_token, second_seq_len_shape, kv_caches, const_params
-        # )
-        # print("======================= Decoding Profiling =======================")
-        # print_as_table(
-        #     sorted(
-        #         cmp_instrument.time_eval_results.items(),
-        #         key=lambda x: -(x[1][0] * x[1][1]),
-        #     )
-        # )
+        logits, kv_caches = vm["decode"](
+            first_sampled_token, second_seq_len_shape, kv_caches, const_params
+        )
+        print("======================= Decoding Profiling =======================")
+        print_as_table(
+            sorted(
+                cmp_instrument.time_eval_results.items(),
+                key=lambda x: -(x[1][0] * x[1][1]),
+            )
+        )
 
-        print(vm.profile("decode", first_sampled_token, second_seq_len_shape, kv_caches, const_params))
+        # print(vm.profile("decode", first_sampled_token, second_seq_len_shape, kv_caches, const_params))
 
 
 if __name__ == "__main__":
