@@ -105,6 +105,7 @@ def _parse_args():
     args.add_argument("--num-input-tokens", type=int, default=32)
     args.add_argument("--num-output-tokens", type=int, default=32)
     args.add_argument("--batch-size", type=int, default=1)
+    args.add_argument("--num-shards", type=int, default=0)
 
     parsed = args.parse_args()
     utils.argparse_postproc_common(parsed)
@@ -112,7 +113,7 @@ def _parse_args():
     parsed.model_path = os.path.join(parsed.artifact_path, "models", parsed.model)
     parsed.artifact_path = os.path.join(
         parsed.artifact_path,
-        f"{parsed.model}-{parsed.quantization.name}"
+        f"{parsed.model}-s{parsed.num_shards}-{parsed.quantization.name}"
     )
     parsed.ggml_file_path = os.path.join(parsed.model_path, parsed.ggml_file_name)
     return parsed
