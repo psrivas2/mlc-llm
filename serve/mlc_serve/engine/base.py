@@ -10,6 +10,8 @@ import inspect
 from .sampling_params import SamplingParams, SamplingType
 
 RequestId = str
+SequenceID = str
+
 
 # TODO(@sunggg): consider transition to something like Pydantic
 @dataclass
@@ -239,22 +241,41 @@ class ScopedInferenceEngine(InferenceEngine):
 
 
 @dataclass
+class GenerationSequence:
+    seq_id: SequenceID
+    generated_token_ids: list[int]
+    next_start_position: int
+    output_text: str
+    is_finished: bool = False
+
+
+@dataclass
 class RequestState:
     """
     The internal state of request in the InferenceEngine.
     """
 
     request_id: RequestId
-    token_ids: list[int]
-    output_text: str
-    prompt_len: int
-    next_start_position: int
+    prompt_token_ids: list[int]
     sampling_params: SamplingParams
+    generation_sequences: list[GenerationSequence]
     stopping_criteria: StoppingCriteria
     debug_options: DebugOptions
     arrival_timestamp: float
-    is_ended: bool = False
     validation_err: Optional[ValidationError] = None
+
+    @property
+    def is_finished(self) -> bool:
+        return all(seq.is_finished for seq in self.generation_sequences)
+
+    @property
+    def prompt_len(self) -> int:
+        return len(self.prompt_token_ids)
+
+    @property
+    def num_sequences(self) -> int:
+        return len(self.generation_sequences)
+
 
 def check_stopping_sequences(stopping_criteria, output_text, delta, is_ended):
     if stopping_criteria.stop_sequences:

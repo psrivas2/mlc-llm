@@ -5,7 +5,7 @@ A implementation of InferenceEngine that executes in the current process.
 import time
 import logging
 from typing import Deque, Set, Dict
-from collections import deque
+from collections import deque, defaultdict
 from threading import Condition, Lock
 
 from .base import (
@@ -19,8 +19,16 @@ from .base import (
     SequenceOutput,
     check_stopping_sequences,
     ValidationError,
+    GenerationSequence,
 )
-from .model_module import DecodeRequest, ModelModule, PrefillRequest, SequenceId, TextGenerator, Tokenizer as TokenizerP
+from .model_module import (
+    DecodeRequest,
+    ModelModule,
+    PrefillRequest,
+    SequenceId,
+    TextGenerator,
+    Tokenizer as TokenizerP,
+)
 from ..model.base import ModelArtifactConfig
 
 logger = logging.getLogger(__name__)
@@ -31,6 +39,7 @@ class SynchronousInferenceEngine(InferenceEngine):
     A implementation of InferenceEngine that does inference synchronously in the current thread
     when `step` is called.
     """
+
     text_generator: TextGenerator
     tokenizer: TokenizerP
     model_artifact_config: ModelArtifactConfig
@@ -53,10 +62,14 @@ class SynchronousInferenceEngine(InferenceEngine):
         self.conversation_template = model_module.conversation_template
         self.cache_manager = model_module.cache_manager
         self.model_artifact_config = model_module.model_artifact_config
-        assert self.model_artifact_config.max_context_length, "max_context_length must not be zero"
+        assert (
+            self.model_artifact_config.max_context_length
+        ), "max_context_length must not be zero"
         self.max_context_length = self.model_artifact_config.max_context_length
         self.max_num_batched_tokens = model_module.engine_config.max_num_batched_tokens
-        assert self.max_num_batched_tokens > 0, "max_num_batched_tokens must be positive"
+        assert (
+            self.max_num_batched_tokens > 0
+        ), "max_num_batched_tokens must be positive"
         self.max_decode_steps = min(
             self.cache_manager.get_kv_cache_size(),
             model_module.engine_config.max_decode_steps,
@@ -79,9 +92,6 @@ class SynchronousInferenceEngine(InferenceEngine):
         new_request_states = []
         for req in requests:
             # TODO: verify that request id is unique
-            if req.num_sequences > 1:
-                raise RuntimeError("num_sequences > 1 is not supported for now")
-
             # wrap the stop sequence with list if necessary
             if req.stopping_criteria.stop_sequences:
                 if isinstance(req.stopping_criteria.stop_sequences, str):
@@ -95,14 +105,18 @@ class SynchronousInferenceEngine(InferenceEngine):
 
             if (
                 state.validation_err is not None
-                or state.prompt_len > min(self.max_context_length, self.max_num_batched_tokens)
+                or state.prompt_len
+                > min(self.max_context_length, self.max_num_batched_tokens)
                 # We make sure that the KV cache will have enough free space for this request to proceed
                 # decoding for at least self.max_decode_steps steps.
-                or self.cache_manager.get_kv_cache_size() - state.prompt_len < self.max_decode_steps
+                or self.cache_manager.get_kv_cache_size() - state.prompt_len
+                < self.max_decode_steps * req.num_sequences
             ):
                 self.cancel(req.request_id)
                 if state.validation_err is None:
-                    state.validation_err = ValidationError("The prompt is too long for the given set of engine parameters.")
+                    state.validation_err = ValidationError(
+                        "The prompt is too long for the given set of engine parameters."
+                    )
 
         with self.queue_lock:
             self.queue.extend(new_request_states)
@@ -125,29 +139,29 @@ class SynchronousInferenceEngine(InferenceEngine):
         logger.debug("Starting new inference step.")
 
         outputs = list[RequestOutput]()
-        result = InferenceStepResult(outputs=outputs)
 
         # TODO: consolidate into a single function
         for state in list(self.current_batch.values()):
             finish_reason = None
-            if state.is_ended:
+            if state.is_finished:
                 finish_reason = FinishReason.Stop
             if self._should_stop_by_length(state):
                 finish_reason = FinishReason.Length
 
             if finish_reason is not None:
+                seq_outputs = [
+                    SequenceOutput(
+                        i,
+                        finish_reason=finish_reason,
+                        num_generated_tokens=len(gen_seq.generated_token_ids),
+                    )
+                    for i, gen_seq in enumerate(state.generation_sequences)
+                ]
+
                 outputs.append(
                     RequestOutput(
                         state.request_id,
-                        [
-                            SequenceOutput(
-                                0,
-                                finish_reason=finish_reason,
-                                num_generated_tokens=(
-                                    len(state.token_ids) - state.prompt_len
-                                ),
-                            )
-                        ],
+                        seq_outputs,
                         num_prompt_tokens=state.prompt_len,
                     )
                 )
@@ -165,34 +179,40 @@ class SynchronousInferenceEngine(InferenceEngine):
 
         for request_id in previous_requests_to_be_cancelled:
             if request_id not in self.requests_to_be_cancelled:
+                # TODO(masahi): Need a mapping from a request ID to num_sequences
+                # But for a cancelled request, it is probably enough to return only
+                # one empty sequence.
+                num_sequences = 1
                 outputs.append(
                     RequestOutput(
                         request_id=request_id,
                         sequences=[
-                            # TODO: support multi-sequence
-                            SequenceOutput(0, finish_reason=FinishReason.Cancelled)
+                            SequenceOutput(i, finish_reason=FinishReason.Cancelled)
+                            for i in range(num_sequences)
                         ],
                     )
                 )
 
         if not self.current_batch:
-            return result
+            return InferenceStepResult(outputs)
 
         requests = self._get_requests_to_process()
         results = self.text_generator.generate(requests, self.cache_manager.get_cache())
         logger.debug("Finished text generation.")
 
         valid_results = []
+        failed_requests = set()
 
         for res in results:
-            # For now we only support single sequence per request
             request_id = res.sequence_id.request_id
-            if res.error is not None:
+            # Report an error for a request if any of its generation sequences fails.
+            if res.error is not None and request_id not in failed_requests:
+                failed_requests.add(request_id)
                 del self.current_batch[request_id]
                 self.cache_manager.free(res.sequence_id)
                 outputs.append(
                     RequestOutput(
-                        res.sequence_id.request_id,
+                        request_id,
                         sequences=[],
                         error=res.error,
                     )
@@ -200,10 +220,14 @@ class SynchronousInferenceEngine(InferenceEngine):
             else:
                 valid_results.append(res)
 
+        seq_outputs = defaultdict(list)
+
         for res in valid_results:
             request_id = res.sequence_id.request_id
+            seq_index = res.sequence_id.sequence_index
             state = self.current_batch[request_id]
-            state.next_start_position = len(state.token_ids)
+            gen_seq = state.generation_sequences[seq_index]
+            gen_seq.next_start_position = len(gen_seq.generated_token_ids)
             new_token_ids = res.generated_tokens
 
             for i, token_id in enumerate(new_token_ids):
@@ -212,37 +236,39 @@ class SynchronousInferenceEngine(InferenceEngine):
                     and not state.debug_options.ignore_eos
                 ):
                     new_token_ids = new_token_ids[:i]
-                    state.is_ended = True
+                    gen_seq.is_finished = True
                     break
 
-            state.token_ids.extend(new_token_ids)
+            gen_seq.generated_token_ids.extend(new_token_ids)
 
-            delta = self._decode_last_output(state)
-            state.output_text += delta
+            delta = self._decode_last_output(state.prompt_token_ids, gen_seq)
+            gen_seq.output_text += delta
 
-            state.output_text, delta, state.is_ended = check_stopping_sequences(
-                state.stopping_criteria, state.output_text, delta, state.is_ended
+            gen_seq.output_text, delta, gen_seq.is_finished = check_stopping_sequences(
+                state.stopping_criteria, gen_seq.output_text, delta, gen_seq.is_finished
             )
 
+            seq_outputs[request_id].append(
+                SequenceOutput(
+                    gen_seq.seq_index,
+                    delta=delta,
+                    num_generated_tokens=(len(gen_seq.generated_token_ids)),
+                )
+            )
+
+        for request_id, seq_outputs in seq_outputs.items():
+            state = self.current_batch[request_id]
             outputs.append(
                 RequestOutput(
                     request_id,
-                    sequences=[
-                        SequenceOutput(
-                            0,
-                            delta=delta,
-                            num_generated_tokens=(
-                                len(state.token_ids) - state.prompt_len
-                            ),
-                        ),
-                    ],
+                    sequences=seq_outputs,
                     num_prompt_tokens=state.prompt_len,
                 )
             )
 
         logger.debug("Finished detokenization and output object creation.")
 
-        return result
+        return InferenceStepResult(outputs)
 
     def _adjust_batch(self):
         with self.queue_lock:
@@ -287,9 +313,14 @@ class SynchronousInferenceEngine(InferenceEngine):
                 # self.max_num_batched_tokens. In such cases, we need to discard the recent decode
                 # tokens that cannot fit into a batch, and recompute them after we fill the cache
                 # entries for the older tokens.
-                if not len(self.current_batch) and num_new_batched_tokens > self.max_num_batched_tokens:
-                    state.token_ids = state.token_ids[:self.max_num_batched_tokens]
-                    state.next_start_position = num_new_batched_tokens = num_tokens = self.max_num_batched_tokens
+                if (
+                    not len(self.current_batch)
+                    and num_new_batched_tokens > self.max_num_batched_tokens
+                ):
+                    state.token_ids = state.token_ids[: self.max_num_batched_tokens]
+                    state.next_start_position = (
+                        num_new_batched_tokens
+                    ) = num_tokens = self.max_num_batched_tokens
                 if num_new_batched_tokens > self.max_num_batched_tokens > 0:
                     logger.debug(
                         "Stop growing the batch due to max_num_batched_tokens. Batched tokens: %s",
@@ -298,10 +329,9 @@ class SynchronousInferenceEngine(InferenceEngine):
                     break
                 # We make sure that the KV cache will have enough free space for this request to proceed
                 # decoding for at least self.max_decode_steps steps.
-                if (
-                    (self.cache_manager.get_free_space() - num_tokens) / (len(self.current_batch) + 1)
-                        < self.max_decode_steps
-                ):
+                if (self.cache_manager.get_free_space() - num_tokens) / (
+                    len(self.current_batch) + 1
+                ) < self.max_decode_steps:
                     logger.debug(
                         "Stop growing the batch due to not enough free space. Free: %s, Num tokens: %s",
                         self.cache_manager.get_free_space(),
@@ -320,16 +350,17 @@ class SynchronousInferenceEngine(InferenceEngine):
         # TODO: consider having hybrid batch if the underlying attention kernel supports
         # mixing prefill and decode.
         is_prompt_batch = any(
-            state.next_start_position == 0 for state in self.current_batch.values()
+            state.generation_sequences[0].next_start_position == 0
+            for state in self.current_batch.values()
         )
 
         if is_prompt_batch:
             for state in self.current_batch.values():
-                if state.next_start_position == 0:
+                if state.generation_sequences[0].next_start_position == 0:
                     requests.append(
                         PrefillRequest(
                             request_id=state.request_id,
-                            token_ids=state.token_ids,
+                            token_ids=state.prompt_token_ids,
                             num_sequence=1,
                             sampling_params=state.sampling_params,
                         )
@@ -341,17 +372,19 @@ class SynchronousInferenceEngine(InferenceEngine):
             )
         else:
             for state in self.current_batch.values():
-                seq_id = SequenceId(state.request_id, 0)
-                requests.append(
-                    DecodeRequest(
-                        sequence_id=seq_id,
-                        token_ids=state.token_ids,
-                        sampling_params=state.sampling_params,
+                for i, gen_seq in enumerate(state.generation_sequences):
+                    seq_id = SequenceId(state.request_id, i)
+                    requests.append(
+                        DecodeRequest(
+                            sequence_id=seq_id,
+                            token_ids=gen_seq.generated_token_ids,
+                            sampling_params=state.sampling_params,
+                        )
                     )
-                )
-                self.cache_manager.extend(
-                    seq_id, len(state.token_ids) - state.next_start_position
-                )
+                    self.cache_manager.extend(
+                        seq_id,
+                        len(gen_seq.generated_token_ids) - gen_seq.next_start_position,
+                    )
             logger.debug("Creating decode batch with %s requests.", len(requests))
 
         return requests
@@ -375,31 +408,43 @@ class SynchronousInferenceEngine(InferenceEngine):
 
         prompt_tokens = self.tokenizer.encode(prompt)
 
+        gen_seqs = [
+            GenerationSequence(
+                seq_id=f"{request.request_id}_{i}",
+                generated_token_ids=[],
+                next_start_position=0,
+                output_text="",
+            )
+            for i in range(request.num_sequences)
+        ]
+
         return RequestState(
             request_id=request.request_id,
-            token_ids=prompt_tokens,
-            prompt_len=len(prompt_tokens),
-            next_start_position=0,
+            prompt_token_ids=prompt_tokens,
+            generation_sequences=gen_seqs,
             sampling_params=request.sampling_params,
             stopping_criteria=request.stopping_criteria,
             debug_options=request.debug_options,
-            output_text="",
             arrival_timestamp=time.time(),
         )
 
-    def _decode_last_output(self, state: RequestState) -> str:
-        if len(state.output_text):
-            prefix_idx = max(0, state.next_start_position - 6)
+    def _decode_last_output(
+        self, prompt_tokens: list[int], generation_sequence: GenerationSequence
+    ) -> str:
+        if len(generation_sequence.output_text):
+            prefix_idx = max(0, generation_sequence.next_start_position - 6)
         else:
-            prefix_idx = state.next_start_position
+            prefix_idx = generation_sequence.next_start_position
+
+        token_ids = prompt_tokens + generation_sequence.generated_token_ids
 
         if prefix_idx == 0:
-            return self.tokenizer.decode(state.token_ids)
+            return self.tokenizer.decode(token_ids)
 
         prefix = self.tokenizer.decode(
-            state.token_ids[prefix_idx : state.next_start_position]
+            token_ids[prefix_idx : generation_sequence.next_start_position]
         )
-        full = self.tokenizer.decode(state.token_ids[prefix_idx:])
+        full = self.tokenizer.decode(token_ids[prefix_idx:])
 
         return full[len(prefix) :]
 
@@ -407,13 +452,17 @@ class SynchronousInferenceEngine(InferenceEngine):
         # TODO: currently, we simply return true for both stopping reasons.
         #       in the future, we can differentiate these two.
         # this include prompt tokens and gen tokens so far
-        num_context_tokens = len(state.token_ids)
-        if num_context_tokens >= self.max_context_length:
-            return True
-        num_gen_tokens = num_context_tokens - state.prompt_len
-        if (
-            state.stopping_criteria.max_tokens is not None
-            and num_gen_tokens >= state.stopping_criteria.max_tokens
-        ):
-            return True
-        return False
+        for gen_seq in state.generation_sequences:
+            num_context_tokens = len(
+                state.prompt_token_ids + gen_seq.generated_token_ids
+            )
+            if num_context_tokens < self.max_context_length:
+                return False
+            num_gen_tokens = num_context_tokens - state.prompt_len
+            if (
+                state.stopping_criteria.max_tokens is not None
+                and num_gen_tokens < state.stopping_criteria.max_tokens
+            ):
+                return False
+
+        return True
