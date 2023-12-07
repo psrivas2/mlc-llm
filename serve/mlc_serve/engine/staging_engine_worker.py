@@ -313,8 +313,8 @@ def run_generation_loop_worker(
     result_queue: multiprocessing.Queue,
     ready_event: multiprocessing.synchronize.Event,
     contextvars: Optional[Dict[str, Any]] = None,
-    enable_json_logs=False,
-    log_level="INFO",
+    enable_json_logs: bool = False,
+    log_level: str = "INFO",
 ):
     configure_logging(enable_json_logs, log_level)
     structlog.contextvars.bind_contextvars(**contextvars)

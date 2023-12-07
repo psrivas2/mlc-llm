@@ -78,21 +78,18 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
             self.queue.extend(new_request_states)
             self.has_new_requests.notify_all()
 
-    def has_pending_requests(self) -> bool:
-        return bool(self.queue or self.current_batch)
-
-    def wait_for_request(self, timeout_seconds=None) -> bool:
-        with self.queue_lock:
-            return self.has_new_requests.wait_for(
-                self.has_pending_requests, timeout=timeout_seconds
-            )
-
     def cancel(self, request_id: RequestId):
         with self.queue_lock:
             # TODO: consider iterating throught the queue to find if request id exist
             # Otherwise cancel a request that's already finished will leave request_id
             # in the `requests_to_be_cancelled` set forever.
             self.requests_to_be_cancelled.add(request_id)
+
+    def wait_for_request(self, timeout_seconds=None) -> bool:
+        with self.queue_lock:
+            return self.has_new_requests.wait_for(
+                self.has_pending_requests, timeout=timeout_seconds
+            )
 
     def step(self) -> InferenceStepResult:
         logger.debug("Starting new inference step.")
@@ -252,6 +249,9 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
             while self.queue and num_new_batched_tokens is not None:
                 num_new_batched_tokens = self.try_grow_batch(num_new_batched_tokens)
                 self._discard_cancelled_requests_from_queue()
+
+    def has_pending_requests(self) -> bool:
+        return bool(self.queue or self.current_batch)
 
     def _discard_cancelled_requests_from_queue(self):
         """

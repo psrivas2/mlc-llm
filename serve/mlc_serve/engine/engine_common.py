@@ -19,7 +19,7 @@ from .base import (
     check_stopping_sequences,
 )
 from .metrics import PrometheusMetrics
-from .metrics_labels import *
+from .metrics_labels import NUM_CACHE_EVICTONS
 from .model_module import (
     DecodeRequest,
     PrefillRequest,
@@ -242,7 +242,7 @@ class EngineBase:
             request_to_remove = min(
                 self.current_batch.values(), key=lambda s: s.num_total_tokens
             )
-            # TODO parallel sampling: Properly support Evicting a multi-sequence request
+            # TODO parallel sampling: Properly support evicting a multi-sequence request
             assert (
                 self.current_batch[request_to_remove.request_id].num_sequences == 1
             ), "Evicting a multi-sequence request is not supported."
@@ -262,7 +262,7 @@ class EngineBase:
                 "Stop growing the batch due to min_decode_steps. Decode steps: %s",
                 max_new_tokens,
             )
-            # stop adding request if there isn't enough space to do a certain steps of decoding.
+            # stop adding request if there isn't enough space to do self.min_decode_steps steps of decoding.
             return None
 
         state = self.queue[0]
@@ -295,7 +295,7 @@ class EngineBase:
             num_tokens = state.prompt_len
             num_new_batched_tokens += num_tokens
 
-        if num_new_batched_tokens > self.max_num_batched_tokens > 0:
+        if num_new_batched_tokens > self.max_num_batched_tokens:
             LOG.debug(
                 "Stop growing the batch due to max_num_batched_tokens. Batched tokens: %s",
                 num_new_batched_tokens,
