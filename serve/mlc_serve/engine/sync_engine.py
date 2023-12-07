@@ -227,7 +227,9 @@ class SynchronousInferenceEngine(InferenceEngine):
             seq_index = res.sequence_id.sequence_index
             state = self.current_batch[request_id]
             gen_seq = state.generation_sequences[seq_index]
-            gen_seq.next_start_position = len(gen_seq.generated_token_ids)
+            gen_seq.next_start_position = len(
+                state.prompt_token_ids + gen_seq.generated_token_ids
+            )
             new_token_ids = res.generated_tokens
 
             for i, token_id in enumerate(new_token_ids):
@@ -285,7 +287,9 @@ class SynchronousInferenceEngine(InferenceEngine):
                 state = self.current_batch[request_to_remove.request_id]
 
                 # TODO parallel sampling: Properly support Evicting a multi-sequence request
-                assert state.num_sequences == 1, "Evicting a multi-sequence request is not supported."
+                assert (
+                    state.num_sequences == 1
+                ), "Evicting a multi-sequence request is not supported."
 
                 self.cache_manager.free_request(state)
                 del self.current_batch[request_to_remove.request_id]
@@ -397,18 +401,17 @@ class SynchronousInferenceEngine(InferenceEngine):
             for state in self.current_batch.values():
                 for gen_seq in state.generation_sequences:
                     if not gen_seq.is_finished:
+                        token_ids = state.prompt_token_ids + gen_seq.generated_token_ids
                         requests.append(
                             DecodeRequest(
                                 sequence_id=gen_seq.seq_id,
-                                token_ids=state.prompt_token_ids
-                                + gen_seq.generated_token_ids,
+                                token_ids=token_ids,
                                 sampling_params=state.sampling_params,
                             )
                         )
                         self.cache_manager.extend(
                             gen_seq.seq_id,
-                            len(gen_seq.generated_token_ids)
-                            - gen_seq.next_start_position,
+                            len(token_ids) - gen_seq.next_start_position,
                         )
             logger.debug("Creating decode batch with %s requests.", len(requests))
 
