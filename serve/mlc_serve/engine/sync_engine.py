@@ -8,6 +8,8 @@ from typing import Deque, Set, Dict
 from collections import deque, defaultdict
 from threading import Condition, Lock
 
+from torchvision.ops.boxes import generalized_box_iou
+
 from .base import (
     FinishReason,
     InferenceEngine,
@@ -280,7 +282,7 @@ class SynchronousInferenceEngine(InferenceEngine):
 
             while self.cache_manager.get_max_new_tokens() < 1:
                 request_to_remove = min(
-                    self.current_batch.values(), key=lambda s: len(s.token_ids)
+                    self.current_batch.values(), key=lambda s: s.num_total_tokens
                 )
                 del self.current_batch[request_to_remove.request_id]
                 self.cache_manager.free(SequenceId(request_to_remove.request_id, 0))
@@ -306,32 +308,44 @@ class SynchronousInferenceEngine(InferenceEngine):
                     # stop adding request if there isn't enough space to do a certain steps of decoding.
                     break
                 state = self.queue[0]
-                num_tokens = len(state.token_ids)
-                num_new_batched_tokens += num_tokens
-                # This can happen when we are recovering from cache eviction and the sum of prompt
-                # and intermediate decode tokens is bigger than the biggest allowable batch size,
-                # self.max_num_batched_tokens. In such cases, we need to discard the recent decode
-                # tokens that cannot fit into a batch, and recompute them after we fill the cache
-                # entries for the older tokens.
-                if (
-                    not len(self.current_batch)
-                    and num_new_batched_tokens > self.max_num_batched_tokens
-                ):
-                    state.token_ids = state.token_ids[: self.max_num_batched_tokens]
-                    state.next_start_position = (
-                        num_new_batched_tokens
-                    ) = num_tokens = self.max_num_batched_tokens
+
+                if state.num_sequences == 1:
+                    gen_seq = state.generation_sequences[0]
+                    num_tokens = state.prompt_len + len(gen_seq.generated_token_ids)
+                    num_new_batched_tokens += num_tokens
+                    # This can happen when we are recovering from cache eviction and the sum of prompt
+                    # and intermediate decode tokens is bigger than the biggest allowable batch size,
+                    # self.max_num_batched_tokens. In such cases, we need to discard the recent decode
+                    # tokens that cannot fit into a batch, and recompute them after we fill the cache
+                    # entries for the older tokens.
+                    if (
+                        not len(self.current_batch)
+                        and num_tokens > self.max_num_batched_tokens
+                    ):
+                        gen_seq.generated_token_ids = gen_seq.generated_token_ids[
+                            : (self.max_num_batched_tokens - state.prompt_len)
+                        ]
+                        gen_seq.next_start_position = (
+                            num_new_batched_tokens
+                        ) = num_tokens = self.max_num_batched_tokens
+                else:
+                    # Evicting and recovering multi-sequence requests is not supported for now.
+                    assert all(gen_seq.next_start_position == 0 for gen_seq in state.generation_sequences)
+                    num_tokens = state.prompt_len
+                    num_new_batched_tokens += num_tokens
+
                 if num_new_batched_tokens > self.max_num_batched_tokens > 0:
                     logger.debug(
                         "Stop growing the batch due to max_num_batched_tokens. Batched tokens: %s",
                         num_new_batched_tokens,
                     )
                     break
+
                 # We make sure that the KV cache will have enough free space for this request to proceed
                 # decoding for at least self.max_decode_steps steps.
                 if (self.cache_manager.get_free_space() - num_tokens) / (
                     len(self.current_batch) + 1
-                ) < self.max_decode_steps:
+                ) < self.max_decode_steps * state.num_sequences:
                     logger.debug(
                         "Stop growing the batch due to not enough free space. Free: %s, Num tokens: %s",
                         self.cache_manager.get_free_space(),
