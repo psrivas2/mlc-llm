@@ -252,7 +252,7 @@ class ScopedInferenceEngine(InferenceEngine):
         ...
 
 
-@dataclass
+@dataclass(frozen=True)
 class SequenceId:
     """
     SequenceId identified a unique sequence to be generated.

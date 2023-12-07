@@ -250,7 +250,7 @@ class SynchronousInferenceEngine(InferenceEngine):
 
             seq_outputs[request_id].append(
                 SequenceOutput(
-                    gen_seq.seq_index,
+                    seq_index,
                     delta=delta,
                     num_generated_tokens=(len(gen_seq.generated_token_ids)),
                 )

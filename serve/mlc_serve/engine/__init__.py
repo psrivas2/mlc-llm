@@ -13,5 +13,6 @@ from .base import (
     MLCServeEngineConfig,
     get_engine_config,
     SequenceId,
+    RequestState,
 )
 from .sampling_params import SamplingParams, SamplingType

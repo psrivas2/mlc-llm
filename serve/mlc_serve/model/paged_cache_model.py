@@ -21,6 +21,7 @@ from ..engine import (
     MLCServeEngineConfig,
     SamplingParams,
     SequenceId,
+    RequestState,
 )
 from ..engine.model_module import (
     DecodeRequest,
@@ -182,6 +183,13 @@ class CacheManager:
             # generation sequences in the same sample are freed.
             del self.allocated_tokens[sequence_id]
             self.set_size([sequence_id], [0])
+
+    def free_request(self, state: RequestState):
+        """
+        Free cache space for all sequences in a request.
+        """
+        for gen_seq in state.generation_sequences:
+            self.free(gen_seq.seq_id)
 
     def get_kv_cache_size(self) -> int:
         """
