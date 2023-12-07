@@ -3,10 +3,11 @@ Common utilites for engine classes.
 """
 
 import time
-import logging
-from typing import Tuple, Deque, Set, Dict, Optional
+from typing import Tuple, Deque, Dict, Optional, Union
 from collections import deque
 from threading import Condition, Lock
+
+import structlog
 
 from .base import (
     Request,
@@ -17,6 +18,8 @@ from .base import (
     StoppingCriteria,
     check_stopping_sequences,
 )
+from .metrics import PrometheusMetrics
+from .metrics_labels import *
 from .model_module import (
     DecodeRequest,
     PrefillRequest,
@@ -29,7 +32,7 @@ from .model_module import (
 )
 from ..model.base import ModelArtifactConfig
 
-logger = logging.getLogger(__name__)
+LOG = structlog.stdlib.get_logger(__name__)
 
 
 def get_new_request_state(
@@ -41,6 +44,10 @@ def get_new_request_state(
         prompt = conversation_template.apply(request.messages)
 
     prompt_tokens = tokenizer.encode(prompt)
+
+    validation_err = None
+    if request.validate_tokens is not None:
+        validation_err = request.validate_tokens(request, prompt_tokens)
 
     gen_seqs = [
         GenerationSequence(
@@ -59,6 +66,7 @@ def get_new_request_state(
         sampling_params=request.sampling_params,
         stopping_criteria=request.stopping_criteria,
         debug_options=request.debug_options,
+        validation_err=validation_err,
         arrival_timestamp=time.time(),
     )
 
@@ -107,7 +115,7 @@ def update_sequence(
 
 def get_requests_to_process(
     current_states: list[RequestState], cache_manager: KVCacheManager
-) -> Tuple[list[Request], bool]:
+) -> Tuple[Union[list[PrefillRequest], list[DecodeRequest]], bool]:
     requests = []
     # TODO: consider having hybrid batch if the underlying attention kernel supports
     # mixing prefill and decode.
@@ -127,10 +135,10 @@ def get_requests_to_process(
                         sampling_params=state.sampling_params,
                     )
                 )
-        logger.debug(
-            "Creating prompt batch with %s requests with %s total tokens.",
-            len(requests),
-            sum(len(r.token_ids) for r in requests),
+        LOG.debug(
+            "Creating prompt batch.",
+            num_requests=len(requests),
+            total_tokens=sum(len(r.token_ids) for r in requests),
         )
     else:
         for state in current_states:
@@ -148,7 +156,7 @@ def get_requests_to_process(
                         gen_seq.seq_id,
                         len(token_ids) - gen_seq.next_start_position,
                     )
-        logger.debug("Creating decode batch with %s requests.", len(requests))
+        LOG.debug("Creating decode batch with %s requests.", len(requests))
 
     return requests, is_prompt_batch
 
@@ -214,6 +222,9 @@ class EngineBase:
 
         self.current_batch = dict[RequestId, RequestState]()
 
+        self.prom_metrics = PrometheusMetrics()
+        self.inv_kv_cache_size = 1.0 / self.cache_manager.get_kv_cache_size()
+
     def check_prompt_too_long(self, prompt_len: int, num_sequences: int = 1) -> bool:
         kv_cache_size = self.cache_manager.get_kv_cache_size()
         max_prompt_len = min(self.max_context_length, self.max_num_batched_tokens)
@@ -227,24 +238,27 @@ class EngineBase:
 
     def evict_request(self):
         while self.cache_manager.get_max_new_tokens() < 1:
+            self.prom_metrics.counter(NUM_CACHE_EVICTONS).inc()
             request_to_remove = min(
                 self.current_batch.values(), key=lambda s: s.num_total_tokens
             )
-            state = self.current_batch[request_to_remove.request_id]
-
             # TODO parallel sampling: Properly support Evicting a multi-sequence request
             assert (
-                state.num_sequences == 1
+                self.current_batch[request_to_remove.request_id].num_sequences == 1
             ), "Evicting a multi-sequence request is not supported."
 
-            self.cache_manager.free_request(state)
-            del self.current_batch[request_to_remove.request_id]
+            self.remove_request_from_batch(request_to_remove.request_id)
             self.queue.appendleft(request_to_remove)
+
+            LOG.debug(
+                "Preempt request to free %s tokens",
+                request_to_remove.num_total_tokens,
+            )
 
     def try_grow_batch(self, num_new_batched_tokens) -> Optional[int]:
         max_new_tokens = self.cache_manager.get_max_new_tokens()
         if max_new_tokens < self.min_decode_steps:
-            logger.debug(
+            LOG.debug(
                 "Stop growing the batch due to min_decode_steps. Decode steps: %s",
                 max_new_tokens,
             )
@@ -262,7 +276,10 @@ class EngineBase:
             # self.max_num_batched_tokens. In such cases, we need to discard the recent decode
             # tokens that cannot fit into a batch, and recompute them after we fill the cache
             # entries for the older tokens.
-            if not len(self.current_batch) and num_tokens > self.max_num_batched_tokens:
+            if (
+                len(self.current_batch) == 0
+                and num_tokens > self.max_num_batched_tokens
+            ):
                 gen_seq.generated_token_ids = gen_seq.generated_token_ids[
                     : (self.max_num_batched_tokens - state.prompt_len)
                 ]
@@ -279,7 +296,7 @@ class EngineBase:
             num_new_batched_tokens += num_tokens
 
         if num_new_batched_tokens > self.max_num_batched_tokens > 0:
-            logger.debug(
+            LOG.debug(
                 "Stop growing the batch due to max_num_batched_tokens. Batched tokens: %s",
                 num_new_batched_tokens,
             )
@@ -290,7 +307,7 @@ class EngineBase:
         if (self.cache_manager.get_free_space() - num_tokens) / (
             len(self.current_batch) + 1
         ) < self.max_decode_steps * state.num_sequences:
-            logger.debug(
+            LOG.debug(
                 "Stop growing the batch due to not enough free space. Free: %s, Num tokens: %s",
                 self.cache_manager.get_free_space(),
                 num_tokens,
@@ -303,3 +320,7 @@ class EngineBase:
         self.current_batch[state.request_id] = state
 
         return num_new_batched_tokens
+
+    def remove_request_from_batch(self, request_id: RequestId):
+        self.cache_manager.free_request(self.current_batch[request_id])
+        del self.current_batch[request_id]

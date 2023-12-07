@@ -133,7 +133,9 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
         if not self.current_batch:
             if len(self.queue) > 0:
                 logger.warning(
-                    f"The engine has {len(self.queue)} requests to be processed in the queue, but none of them were added to the current batch during the execution of SyncEngine._adjust_batch"
+                    f"The engine has {len(self.queue)} requests to be processed in the"
+                    " queue, but none of them were added to the current batch during"
+                    " the execution of SyncEngine._adjust_batch"
                 )
 
         for request_id in previous_requests_to_be_cancelled:
@@ -169,8 +171,7 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
             # Report an error for a request if any of its generation sequences fails.
             if res.error is not None and request_id not in failed_requests:
                 failed_requests.add(request_id)
-                self.cache_manager.free_request(self.current_batch[request_id])
-                del self.current_batch[request_id]
+                self.remove_request_from_batch(request_id)
                 outputs.append(
                     RequestOutput(
                         request_id,
@@ -250,12 +251,8 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
 
             num_new_batched_tokens = len(self.current_batch)
 
-            while self.queue:
+            while self.queue and num_new_batched_tokens is not None:
                 num_new_batched_tokens = self.try_grow_batch(num_new_batched_tokens)
-
-                if num_new_batched_tokens is None:
-                    break
-
                 self._discard_cancelled_requests_from_queue()
 
     def _discard_cancelled_requests_from_queue(self):
