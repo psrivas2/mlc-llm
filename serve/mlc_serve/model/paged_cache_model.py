@@ -662,7 +662,7 @@ class Model:
                     outputs.append(
                         TextGenerationResult(
                             sequence_id=sequence_id,
-                            generated_tokens=[maybe_new_token[0]],
+                            generated_tokens=[maybe_new_token[0]],  # type: ignore
                             error=None,
                         )
                     )

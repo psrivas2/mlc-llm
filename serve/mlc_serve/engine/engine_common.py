@@ -115,8 +115,8 @@ def update_sequence(
 
 def get_requests_to_process(
     current_states: list[RequestState], cache_manager: KVCacheManager
-) -> Tuple[Union[list[PrefillRequest], list[DecodeRequest]], bool]:
-    requests = []
+) -> Tuple[list[Union[PrefillRequest, DecodeRequest]], bool]:
+    requests : list[Union[PrefillRequest, DecodeRequest]] = []
     # TODO: consider having hybrid batch if the underlying attention kernel supports
     # mixing prefill and decode.
     is_prompt_batch = any(

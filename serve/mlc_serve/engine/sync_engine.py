@@ -4,7 +4,7 @@ A implementation of InferenceEngine that executes in the current process.
 
 import logging
 from collections import defaultdict
-from typing import Set
+from typing import Set, DefaultDict
 
 from .base import (
     FinishReason,
@@ -108,19 +108,17 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                 finish_reason = FinishReason.Length
 
             if finish_reason is not None:
-                seq_outputs = [
-                    SequenceOutput(
-                        i,
-                        finish_reason=finish_reason,
-                        num_generated_tokens=len(gen_seq.generated_token_ids),
-                    )
-                    for i, gen_seq in enumerate(state.generation_sequences)
-                ]
-
                 outputs.append(
                     RequestOutput(
                         state.request_id,
-                        seq_outputs,
+                        [
+                            SequenceOutput(
+                                i,
+                                finish_reason=finish_reason,
+                                num_generated_tokens=len(gen_seq.generated_token_ids),
+                            )
+                            for i, gen_seq in enumerate(state.generation_sequences)
+                        ],
                         num_prompt_tokens=state.prompt_len,
                     )
                 )
@@ -158,7 +156,7 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
             return InferenceStepResult(outputs)
 
         requests, _ = get_requests_to_process(
-            self.current_batch.values(), self.cache_manager
+            list(self.current_batch.values()), self.cache_manager
         )
         results = self.text_generator.generate(requests, self.cache_manager.get_cache())
         logger.debug("Finished text generation.")
@@ -182,7 +180,7 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
             else:
                 valid_results.append(res)
 
-        seq_outputs = defaultdict(list)
+        seq_outputs: DefaultDict[RequestId, list[SequenceOutput]] = defaultdict(list)
 
         for res in valid_results:
             request_id = res.sequence_id.request_id
@@ -216,12 +214,12 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                 )
             )
 
-        for request_id, seq_outputs in seq_outputs.items():
+        for request_id, out_seqs in seq_outputs.items():
             state = self.current_batch[request_id]
             outputs.append(
                 RequestOutput(
                     request_id,
-                    sequences=seq_outputs,
+                    sequences=out_seqs,
                     num_prompt_tokens=state.prompt_len,
                 )
             )
