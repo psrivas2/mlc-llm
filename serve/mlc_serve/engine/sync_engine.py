@@ -22,6 +22,7 @@ from .base import (
     GenerationSequence,
     SequenceId,
 )
+from .engine_common import decode_last_output, should_stop_by_length
 from .model_module import (
     DecodeRequest,
     ModelModule,
@@ -145,7 +146,7 @@ class SynchronousInferenceEngine(InferenceEngine):
             finish_reason = None
             if state.is_finished:
                 finish_reason = FinishReason.Stop
-            if self._should_stop_by_length(state):
+            if should_stop_by_length(state, self.max_context_length):
                 finish_reason = FinishReason.Length
 
             if finish_reason is not None:
@@ -243,7 +244,7 @@ class SynchronousInferenceEngine(InferenceEngine):
 
             gen_seq.generated_token_ids.extend(new_token_ids)
 
-            delta = self._decode_last_output(state.prompt_token_ids, gen_seq)
+            delta = decode_last_output(state.prompt_token_ids, gen_seq, self.tokenizer)
             gen_seq.output_text += delta
 
             gen_seq.output_text, delta, gen_seq.is_finished = check_stopping_sequences(
@@ -455,47 +456,3 @@ class SynchronousInferenceEngine(InferenceEngine):
             debug_options=request.debug_options,
             arrival_timestamp=time.time(),
         )
-
-    def _decode_last_output(
-        self, prompt_tokens: list[int], generation_sequence: GenerationSequence
-    ) -> str:
-        if len(generation_sequence.output_text):
-            prefix_idx = max(0, generation_sequence.next_start_position - 6)
-        else:
-            prefix_idx = generation_sequence.next_start_position
-
-        token_ids = prompt_tokens + generation_sequence.generated_token_ids
-
-        if prefix_idx == 0:
-            return self.tokenizer.decode(token_ids)
-
-        prefix = self.tokenizer.decode(
-            token_ids[prefix_idx : generation_sequence.next_start_position]
-        )
-        full = self.tokenizer.decode(token_ids[prefix_idx:])
-
-        return full[len(prefix) :]
-
-    def _should_stop_by_length(self, state: RequestState) -> bool:
-        # TODO: currently, we simply return true for both stopping reasons.
-        #       in the future, we can differentiate these two.
-        # this include prompt tokens and gen tokens so far
-        for gen_seq in state.generation_sequences:
-            if gen_seq.is_finished:
-                continue
-
-            num_context_tokens = len(
-                state.prompt_token_ids + gen_seq.generated_token_ids
-            )
-            if num_context_tokens >= self.max_context_length:
-                gen_seq.is_finished = True
-                continue
-
-            num_gen_tokens = num_context_tokens - state.prompt_len
-            if (
-                state.stopping_criteria.max_tokens is not None
-                and num_gen_tokens < state.stopping_criteria.max_tokens
-            ):
-                return False
-
-        return True
