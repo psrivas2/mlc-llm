@@ -194,9 +194,9 @@ class StagingInferenceEngine(ScopedInferenceEngine):
             )
 
             seq_outputs = defaultdict(list)
+            prompt_len = {}
 
             for seq_output in generation_output.sequences:
-                # TODO: support multi-sequence per request
                 request_id = seq_output.id.request_id
                 if request_id not in self.requests:
                     LOG.warn(
@@ -233,26 +233,24 @@ class StagingInferenceEngine(ScopedInferenceEngine):
                 if state.is_finished:
                     self.stop_request(state.request_id)
 
-                seq_outputs[request_id].append(
-                    (
-                        SequenceOutput(
-                            seq_output.id.sequence_index,
-                            delta,
-                            num_generated_tokens=len(gen_seq.generated_token_ids),
-                        ),
-                        state.prompt_len,
-                    )
+                output = SequenceOutput(
+                    seq_output.id.sequence_index,
+                    delta,
+                    num_generated_tokens=len(gen_seq.generated_token_ids),
                 )
+
+                seq_outputs[request_id].append(output)
+                prompt_len[request_id] = state.prompt_len
 
                 if seq_output.finish_reason is not None:
                     del self.requests[request_id]
 
-            for request_id, (seq_outputs, prompt_len) in seq_outputs.items():
+            for request_id, out_seqs in seq_outputs.items():
                 outputs.append(
                     RequestOutput(
                         request_id,
-                        sequences=seq_outputs,
-                        num_prompt_tokens=prompt_len,
+                        sequences=out_seqs,
+                        num_prompt_tokens=prompt_len[request_id],
                     )
                 )
 

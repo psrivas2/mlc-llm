@@ -218,7 +218,7 @@ class GenerationLoopWorker(EngineBase):
         for res in results:
             request_id = res.sequence_id.request_id
 
-            if res.error is not None or request_id in failed_requests:
+            if res.error is not None:
                 if request_id not in failed_requests:
                     failed_requests.add(request_id)
                     self.remove_request_from_batch(request_id)
