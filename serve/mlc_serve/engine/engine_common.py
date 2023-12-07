@@ -4,10 +4,13 @@ Common utilites for engine classes.
 
 import time
 import logging
-from typing import Tuple
+from typing import Tuple, Deque, Set, Dict, Optional
+from collections import deque
+from threading import Condition, Lock
 
 from .base import (
     Request,
+    RequestId,
     RequestState,
     GenerationSequence,
     SequenceId,
@@ -20,8 +23,11 @@ from .model_module import (
     Tokenizer,
     ConversationTemplate,
     KVCacheManager,
+    ModelModule,
+    TextGenerator,
+    Tokenizer as TokenizerP,
 )
-
+from ..model.base import ModelArtifactConfig
 
 logger = logging.getLogger(__name__)
 
@@ -170,12 +176,130 @@ def should_stop_by_length(state: RequestState, max_context_length: int) -> bool:
     return True
 
 
-def check_prompt_too_long(
-    prompt_len: int, prompt_limit: int, kv_cache_size: int, min_token_to_generate: int
-) -> bool:
-    # We make sure that the KV cache will have enough free space for this request to generate
-    # at least min_token_to_generate tokens.
-    return (
-        prompt_len > prompt_limit
-        or (kv_cache_size - prompt_len) < min_token_to_generate
-    )
+class EngineBase:
+    text_generator: TextGenerator
+    tokenizer: TokenizerP
+    model_artifact_config: ModelArtifactConfig
+    max_context_length: int
+    max_num_batched_tokens: int
+    max_decode_steps: int
+    min_decode_steps: int
+    queue_lock: Lock
+    queue: Deque[RequestState]
+    has_new_requests: Condition
+    current_batch: Dict[RequestId, RequestState]
+
+    def __init__(self, model_module: ModelModule):
+        self.text_generator = model_module.text_generator
+        self.tokenizer = model_module.tokenizer
+        self.conversation_template = model_module.conversation_template
+        self.cache_manager = model_module.cache_manager
+        self.model_artifact_config = model_module.model_artifact_config
+        assert (
+            self.model_artifact_config.max_context_length
+        ), "max_context_length must not be zero"
+        self.max_context_length = self.model_artifact_config.max_context_length
+        self.max_num_batched_tokens = model_module.engine_config.max_num_batched_tokens
+        self.max_decode_steps = min(
+            self.cache_manager.get_kv_cache_size(),
+            model_module.engine_config.max_decode_steps,
+        )
+        self.min_decode_steps = min(
+            self.max_decode_steps - 1, model_module.engine_config.min_decode_steps
+        )
+
+        self.queue_lock = Lock()
+        self.queue = deque[RequestState]()
+        self.has_new_requests = Condition(lock=self.queue_lock)
+
+        self.current_batch = dict[RequestId, RequestState]()
+
+    def check_prompt_too_long(self, prompt_len: int, num_sequences: int = 1) -> bool:
+        kv_cache_size = self.cache_manager.get_kv_cache_size()
+        max_prompt_len = min(self.max_context_length, self.max_num_batched_tokens)
+
+        # We make sure that the KV cache will have enough free space for this request to proceed
+        # decoding for at least self.max_decode_steps steps.
+        return (
+            prompt_len > max_prompt_len
+            or (kv_cache_size - prompt_len) < self.max_decode_steps * num_sequences
+        )
+
+    def evict_request(self):
+        while self.cache_manager.get_max_new_tokens() < 1:
+            request_to_remove = min(
+                self.current_batch.values(), key=lambda s: s.num_total_tokens
+            )
+            state = self.current_batch[request_to_remove.request_id]
+
+            # TODO parallel sampling: Properly support Evicting a multi-sequence request
+            assert (
+                state.num_sequences == 1
+            ), "Evicting a multi-sequence request is not supported."
+
+            self.cache_manager.free_request(state)
+            del self.current_batch[request_to_remove.request_id]
+            self.queue.appendleft(request_to_remove)
+
+    def try_grow_batch(self, num_new_batched_tokens) -> Optional[int]:
+        max_new_tokens = self.cache_manager.get_max_new_tokens()
+        if max_new_tokens < self.min_decode_steps:
+            logger.debug(
+                "Stop growing the batch due to min_decode_steps. Decode steps: %s",
+                max_new_tokens,
+            )
+            # stop adding request if there isn't enough space to do a certain steps of decoding.
+            return None
+
+        state = self.queue[0]
+
+        if state.num_sequences == 1:
+            gen_seq = state.generation_sequences[0]
+            num_tokens = state.prompt_len + len(gen_seq.generated_token_ids)
+            num_new_batched_tokens += num_tokens
+            # This can happen when we are recovering from cache eviction and the sum of prompt
+            # and intermediate decode tokens is bigger than the biggest allowable batch size,
+            # self.max_num_batched_tokens. In such cases, we need to discard the recent decode
+            # tokens that cannot fit into a batch, and recompute them after we fill the cache
+            # entries for the older tokens.
+            if not len(self.current_batch) and num_tokens > self.max_num_batched_tokens:
+                gen_seq.generated_token_ids = gen_seq.generated_token_ids[
+                    : (self.max_num_batched_tokens - state.prompt_len)
+                ]
+                gen_seq.next_start_position = (
+                    num_new_batched_tokens
+                ) = num_tokens = self.max_num_batched_tokens
+        else:
+            # Evicting and recovering multi-sequence requests is not supported for now.
+            assert all(
+                gen_seq.next_start_position == 0
+                for gen_seq in state.generation_sequences
+            )
+            num_tokens = state.prompt_len
+            num_new_batched_tokens += num_tokens
+
+        if num_new_batched_tokens > self.max_num_batched_tokens > 0:
+            logger.debug(
+                "Stop growing the batch due to max_num_batched_tokens. Batched tokens: %s",
+                num_new_batched_tokens,
+            )
+            return None
+
+        # We make sure that the KV cache will have enough free space for this request to proceed
+        # decoding for at least self.max_decode_steps steps.
+        if (self.cache_manager.get_free_space() - num_tokens) / (
+            len(self.current_batch) + 1
+        ) < self.max_decode_steps * state.num_sequences:
+            logger.debug(
+                "Stop growing the batch due to not enough free space. Free: %s, Num tokens: %s",
+                self.cache_manager.get_free_space(),
+                num_tokens,
+            )
+            return None
+
+        self.queue.popleft()
+        # TODO parallel sampling: Need update here when evicting multi-sequence requests is supported.
+        self.cache_manager.allocate(state.request_id, num_tokens)
+        self.current_batch[state.request_id] = state
+
+        return num_new_batched_tokens

@@ -6,9 +6,7 @@ import logging
 import multiprocessing
 import queue
 from threading import Lock
-from typing import Callable, Optional
-
-import os
+from typing import Callable
 
 import structlog
 
