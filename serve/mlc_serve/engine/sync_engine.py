@@ -484,8 +484,10 @@ class SynchronousInferenceEngine(InferenceEngine):
             num_context_tokens = len(
                 state.prompt_token_ids + gen_seq.generated_token_ids
             )
-            if num_context_tokens < self.max_context_length:
-                return False
+            if num_context_tokens >= self.max_context_length:
+                gen_seq.is_finished = True
+                continue
+
             num_gen_tokens = num_context_tokens - state.prompt_len
             if (
                 state.stopping_criteria.max_tokens is not None
