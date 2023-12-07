@@ -8,8 +8,6 @@ from typing import Deque, Set, Dict
 from collections import deque, defaultdict
 from threading import Condition, Lock
 
-from torchvision.ops.boxes import generalized_box_iou
-
 from .base import (
     FinishReason,
     InferenceEngine,
@@ -22,12 +20,12 @@ from .base import (
     check_stopping_sequences,
     ValidationError,
     GenerationSequence,
+    SequenceId,
 )
 from .model_module import (
     DecodeRequest,
     ModelModule,
     PrefillRequest,
-    SequenceId,
     TextGenerator,
     Tokenizer as TokenizerP,
 )
@@ -168,7 +166,7 @@ class SynchronousInferenceEngine(InferenceEngine):
                     )
                 )
                 self.current_batch.pop(state.request_id)
-                self.cache_manager.free(SequenceId(state.request_id, 0))
+                self.cache_manager.free_request(state)
 
         previous_requests_to_be_cancelled = set(self.requests_to_be_cancelled)
         self._adjust_batch()
@@ -210,8 +208,8 @@ class SynchronousInferenceEngine(InferenceEngine):
             # Report an error for a request if any of its generation sequences fails.
             if res.error is not None and request_id not in failed_requests:
                 failed_requests.add(request_id)
+                self.cache_manager.free_request(self.current_batch[request_id])
                 del self.current_batch[request_id]
-                self.cache_manager.free(res.sequence_id)
                 outputs.append(
                     RequestOutput(
                         request_id,
@@ -277,15 +275,20 @@ class SynchronousInferenceEngine(InferenceEngine):
             for request_id in list(self.requests_to_be_cancelled):
                 if request_id in self.current_batch:
                     state = self.current_batch.pop(request_id)
-                    self.cache_manager.free(state.request_id)
+                    self.cache_manager.free_request(state)
                     self.requests_to_be_cancelled.remove(request_id)
 
             while self.cache_manager.get_max_new_tokens() < 1:
                 request_to_remove = min(
                     self.current_batch.values(), key=lambda s: s.num_total_tokens
                 )
+                state = self.current_batch[request_to_remove.request_id]
+
+                # TODO parallel sampling: Properly support Evicting a multi-sequence request
+                assert state.num_sequences == 1, "Evicting a multi-sequence request is not supported."
+
+                self.cache_manager.free_request(state)
                 del self.current_batch[request_to_remove.request_id]
-                self.cache_manager.free(SequenceId(request_to_remove.request_id, 0))
                 self.queue.appendleft(request_to_remove)
 
             self._discard_cancelled_requests_from_queue()
@@ -298,6 +301,7 @@ class SynchronousInferenceEngine(InferenceEngine):
                 return
 
             num_new_batched_tokens = len(self.current_batch)
+
             while self.queue:
                 max_new_tokens = self.cache_manager.get_max_new_tokens()
                 if max_new_tokens < self.min_decode_steps:
@@ -307,6 +311,7 @@ class SynchronousInferenceEngine(InferenceEngine):
                     )
                     # stop adding request if there isn't enough space to do a certain steps of decoding.
                     break
+
                 state = self.queue[0]
 
                 if state.num_sequences == 1:
@@ -330,7 +335,10 @@ class SynchronousInferenceEngine(InferenceEngine):
                         ) = num_tokens = self.max_num_batched_tokens
                 else:
                     # Evicting and recovering multi-sequence requests is not supported for now.
-                    assert all(gen_seq.next_start_position == 0 for gen_seq in state.generation_sequences)
+                    assert all(
+                        gen_seq.next_start_position == 0
+                        for gen_seq in state.generation_sequences
+                    )
                     num_tokens = state.prompt_len
                     num_new_batched_tokens += num_tokens
 
@@ -354,6 +362,7 @@ class SynchronousInferenceEngine(InferenceEngine):
                     break
 
                 self.queue.popleft()
+                # TODO parallel sampling: Need update here when evicting multi-sequence requests is supported.
                 self.cache_manager.allocate(state.request_id, num_tokens)
                 self.current_batch[state.request_id] = state
 
@@ -375,7 +384,7 @@ class SynchronousInferenceEngine(InferenceEngine):
                         PrefillRequest(
                             request_id=state.request_id,
                             token_ids=state.prompt_token_ids,
-                            num_sequence=1,
+                            num_sequence=state.num_sequences,
                             sampling_params=state.sampling_params,
                         )
                     )
@@ -386,19 +395,21 @@ class SynchronousInferenceEngine(InferenceEngine):
             )
         else:
             for state in self.current_batch.values():
-                for i, gen_seq in enumerate(state.generation_sequences):
-                    seq_id = SequenceId(state.request_id, i)
-                    requests.append(
-                        DecodeRequest(
-                            sequence_id=seq_id,
-                            token_ids=gen_seq.generated_token_ids,
-                            sampling_params=state.sampling_params,
+                for gen_seq in state.generation_sequences:
+                    if not gen_seq.is_finished:
+                        requests.append(
+                            DecodeRequest(
+                                sequence_id=gen_seq.seq_id,
+                                token_ids=state.prompt_token_ids
+                                + gen_seq.generated_token_ids,
+                                sampling_params=state.sampling_params,
+                            )
                         )
-                    )
-                    self.cache_manager.extend(
-                        seq_id,
-                        len(gen_seq.generated_token_ids) - gen_seq.next_start_position,
-                    )
+                        self.cache_manager.extend(
+                            gen_seq.seq_id,
+                            len(gen_seq.generated_token_ids)
+                            - gen_seq.next_start_position,
+                        )
             logger.debug("Creating decode batch with %s requests.", len(requests))
 
         return requests
@@ -424,7 +435,7 @@ class SynchronousInferenceEngine(InferenceEngine):
 
         gen_seqs = [
             GenerationSequence(
-                seq_id=f"{request.request_id}_{i}",
+                seq_id=SequenceId(request.request_id, i),
                 generated_token_ids=[],
                 next_start_position=0,
                 output_text="",
@@ -467,6 +478,9 @@ class SynchronousInferenceEngine(InferenceEngine):
         #       in the future, we can differentiate these two.
         # this include prompt tokens and gen tokens so far
         for gen_seq in state.generation_sequences:
+            if gen_seq.is_finished:
+                continue
+
             num_context_tokens = len(
                 state.prompt_token_ids + gen_seq.generated_token_ids
             )

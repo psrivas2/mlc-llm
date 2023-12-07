@@ -10,7 +10,6 @@ import inspect
 from .sampling_params import SamplingParams, SamplingType
 
 RequestId = str
-SequenceID = str
 
 
 # TODO(@sunggg): consider transition to something like Pydantic
@@ -254,8 +253,21 @@ class ScopedInferenceEngine(InferenceEngine):
 
 
 @dataclass
+class SequenceId:
+    """
+    SequenceId identified a unique sequence to be generated.
+
+    Each request will have `n` unique SequenceIds, where `n` is
+    the `n` from SamplingParams.
+    """
+
+    request_id: RequestId
+    sequence_index: int
+
+
+@dataclass
 class GenerationSequence:
-    seq_id: SequenceID
+    seq_id: SequenceId
     generated_token_ids: list[int]
     next_start_position: int
     output_text: str

@@ -11,14 +11,13 @@ from typing import Callable, Optional, Union, Any, Dict, Deque, List
 
 import structlog
 
-from .base import FinishReason, RequestId, RequestState, ValidationError
+from .base import FinishReason, RequestId, RequestState, ValidationError, SequenceId,
 from .metrics import PrometheusMetrics
 from .metrics_labels import *
 from .model_module import (
     DecodeRequest,
     ModelModule,
     PrefillRequest,
-    SequenceId,
     TextGenerator,
     Tokenizer as TokenizerP,
 )
