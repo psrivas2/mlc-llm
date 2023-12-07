@@ -11,6 +11,8 @@ from .base import (
     RequestState,
     GenerationSequence,
     SequenceId,
+    StoppingCriteria,
+    check_stopping_sequences,
 )
 from .model_module import (
     DecodeRequest,
@@ -22,54 +24,6 @@ from .model_module import (
 
 
 logger = logging.getLogger(__name__)
-
-
-def get_requests_to_process(
-    current_states: list[RequestState], cache_manager: KVCacheManager
-) -> Tuple[list[Request], bool]:
-    requests = []
-    # TODO: consider having hybrid batch if the underlying attention kernel supports
-    # mixing prefill and decode.
-    is_prompt_batch = any(
-        state.generation_sequences[0].next_start_position == 0
-        for state in current_states
-    )
-
-    if is_prompt_batch:
-        for state in current_states:
-            if state.generation_sequences[0].next_start_position == 0:
-                requests.append(
-                    PrefillRequest(
-                        request_id=state.request_id,
-                        token_ids=state.prompt_token_ids,
-                        num_sequence=state.num_sequences,
-                        sampling_params=state.sampling_params,
-                    )
-                )
-        logger.debug(
-            "Creating prompt batch with %s requests with %s total tokens.",
-            len(requests),
-            sum(len(r.token_ids) for r in requests),
-        )
-    else:
-        for state in current_states:
-            for gen_seq in state.generation_sequences:
-                if not gen_seq.is_finished:
-                    token_ids = state.prompt_token_ids + gen_seq.generated_token_ids
-                    requests.append(
-                        DecodeRequest(
-                            sequence_id=gen_seq.seq_id,
-                            token_ids=token_ids,
-                            sampling_params=state.sampling_params,
-                        )
-                    )
-                    cache_manager.extend(
-                        gen_seq.seq_id,
-                        len(token_ids) - gen_seq.next_start_position,
-                    )
-        logger.debug("Creating decode batch with %s requests.", len(requests))
-
-    return requests, is_prompt_batch
 
 
 def get_new_request_state(
@@ -126,6 +80,73 @@ def decode_last_output(
     return full[len(prefix) :]
 
 
+def update_sequence(
+    gen_seq: GenerationSequence,
+    new_token_ids: list[int],
+    prompt_token_ids: list[int],
+    tokenizer: Tokenizer,
+    stopping_criteria: StoppingCriteria,
+) -> str:
+    gen_seq.next_start_position = len(prompt_token_ids + gen_seq.generated_token_ids)
+    gen_seq.generated_token_ids.extend(new_token_ids)
+    delta = decode_last_output(prompt_token_ids, gen_seq, tokenizer)
+    gen_seq.output_text += delta
+
+    gen_seq.output_text, delta, gen_seq.is_finished = check_stopping_sequences(
+        stopping_criteria, gen_seq.output_text, delta, gen_seq.is_finished
+    )
+
+    return delta
+
+
+def get_requests_to_process(
+    current_states: list[RequestState], cache_manager: KVCacheManager
+) -> Tuple[list[Request], bool]:
+    requests = []
+    # TODO: consider having hybrid batch if the underlying attention kernel supports
+    # mixing prefill and decode.
+    is_prompt_batch = any(
+        state.generation_sequences[0].next_start_position == 0
+        for state in current_states
+    )
+
+    if is_prompt_batch:
+        for state in current_states:
+            if state.generation_sequences[0].next_start_position == 0:
+                requests.append(
+                    PrefillRequest(
+                        request_id=state.request_id,
+                        token_ids=state.prompt_token_ids,
+                        num_sequence=state.num_sequences,
+                        sampling_params=state.sampling_params,
+                    )
+                )
+        logger.debug(
+            "Creating prompt batch with %s requests with %s total tokens.",
+            len(requests),
+            sum(len(r.token_ids) for r in requests),
+        )
+    else:
+        for state in current_states:
+            for gen_seq in state.generation_sequences:
+                if not gen_seq.is_finished:
+                    token_ids = state.prompt_token_ids + gen_seq.generated_token_ids
+                    requests.append(
+                        DecodeRequest(
+                            sequence_id=gen_seq.seq_id,
+                            token_ids=token_ids,
+                            sampling_params=state.sampling_params,
+                        )
+                    )
+                    cache_manager.extend(
+                        gen_seq.seq_id,
+                        len(token_ids) - gen_seq.next_start_position,
+                    )
+        logger.debug("Creating decode batch with %s requests.", len(requests))
+
+    return requests, is_prompt_batch
+
+
 def should_stop_by_length(state: RequestState, max_context_length: int) -> bool:
     # TODO: currently, we simply return true for both stopping reasons.
     #       in the future, we can differentiate these two.
@@ -147,3 +168,14 @@ def should_stop_by_length(state: RequestState, max_context_length: int) -> bool:
             return False
 
     return True
+
+
+def check_prompt_too_long(
+    prompt_len: int, prompt_limit: int, kv_cache_size: int, min_token_to_generate: int
+) -> bool:
+    # We make sure that the KV cache will have enough free space for this request to generate
+    # at least min_token_to_generate tokens.
+    return (
+        prompt_len > prompt_limit
+        or (kv_cache_size - prompt_len) < min_token_to_generate
+    )

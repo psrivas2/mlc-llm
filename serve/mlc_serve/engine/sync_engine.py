@@ -16,14 +16,14 @@ from .base import (
     RequestOutput,
     RequestState,
     SequenceOutput,
-    check_stopping_sequences,
     ValidationError,
 )
 from .engine_common import (
-    decode_last_output,
     should_stop_by_length,
     get_new_request_state,
     get_requests_to_process,
+    check_prompt_too_long,
+    update_sequence,
 )
 from .model_module import (
     ModelModule,
@@ -106,14 +106,11 @@ class SynchronousInferenceEngine(InferenceEngine):
             )
             new_request_states.append(state)
 
-            if (
-                state.validation_err is not None
-                or state.prompt_len
-                > min(self.max_context_length, self.max_num_batched_tokens)
-                # We make sure that the KV cache will have enough free space for this request to proceed
-                # decoding for at least self.max_decode_steps steps.
-                or self.cache_manager.get_kv_cache_size() - state.prompt_len
-                < self.max_decode_steps * req.num_sequences
+            if state.validation_err is not None or check_prompt_too_long(
+                state.prompt_len,
+                min(self.max_context_length, self.max_num_batched_tokens),
+                self.cache_manager.get_kv_cache_size(),
+                self.max_decode_steps * req.num_sequences,
             ):
                 self.cancel(req.request_id)
                 if state.validation_err is None:
@@ -199,7 +196,9 @@ class SynchronousInferenceEngine(InferenceEngine):
         if not self.current_batch:
             return InferenceStepResult(outputs)
 
-        requests, _ = get_requests_to_process(self.current_batch.values(), self.cache_manager)
+        requests, _ = get_requests_to_process(
+            self.current_batch.values(), self.cache_manager
+        )
         results = self.text_generator.generate(requests, self.cache_manager.get_cache())
         logger.debug("Finished text generation.")
 
@@ -230,9 +229,6 @@ class SynchronousInferenceEngine(InferenceEngine):
             seq_index = res.sequence_id.sequence_index
             state = self.current_batch[request_id]
             gen_seq = state.generation_sequences[seq_index]
-            gen_seq.next_start_position = len(
-                state.prompt_token_ids + gen_seq.generated_token_ids
-            )
             new_token_ids = res.generated_tokens
 
             for i, token_id in enumerate(new_token_ids):
@@ -244,20 +240,19 @@ class SynchronousInferenceEngine(InferenceEngine):
                     gen_seq.is_finished = True
                     break
 
-            gen_seq.generated_token_ids.extend(new_token_ids)
-
-            delta = decode_last_output(state.prompt_token_ids, gen_seq, self.tokenizer)
-            gen_seq.output_text += delta
-
-            gen_seq.output_text, delta, gen_seq.is_finished = check_stopping_sequences(
-                state.stopping_criteria, gen_seq.output_text, delta, gen_seq.is_finished
+            delta = update_sequence(
+                gen_seq,
+                new_token_ids,
+                state.prompt_token_ids,
+                self.tokenizer,
+                state.stopping_criteria,
             )
 
             seq_outputs[request_id].append(
                 SequenceOutput(
                     seq_index,
-                    delta=delta,
-                    num_generated_tokens=(len(gen_seq.generated_token_ids)),
+                    delta,
+                    num_generated_tokens=len(gen_seq.generated_token_ids),
                 )
             )
 
@@ -374,7 +369,6 @@ class SynchronousInferenceEngine(InferenceEngine):
                 self.current_batch[state.request_id] = state
 
                 self._discard_cancelled_requests_from_queue()
-
 
     def has_pending_requests(self) -> bool:
         return bool(self.queue or self.current_batch)
