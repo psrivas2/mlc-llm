@@ -2,7 +2,6 @@
 A implementation of InferenceEngine that executes in the current process.
 """
 
-import time
 import logging
 from typing import Deque, Set, Dict
 from collections import deque, defaultdict
@@ -19,14 +18,15 @@ from .base import (
     SequenceOutput,
     check_stopping_sequences,
     ValidationError,
-    GenerationSequence,
-    SequenceId,
 )
-from .engine_common import decode_last_output, should_stop_by_length
+from .engine_common import (
+    decode_last_output,
+    should_stop_by_length,
+    get_new_request_state,
+    get_requests_to_process,
+)
 from .model_module import (
-    DecodeRequest,
     ModelModule,
-    PrefillRequest,
     TextGenerator,
     Tokenizer as TokenizerP,
 )
@@ -101,7 +101,9 @@ class SynchronousInferenceEngine(InferenceEngine):
                     ]
                 assert isinstance(req.stopping_criteria.stop_sequences, list)
 
-            state = self._get_new_request_state(req)
+            state = get_new_request_state(
+                req, self.conversation_template, self.tokenizer
+            )
             new_request_states.append(state)
 
             if (
@@ -197,7 +199,7 @@ class SynchronousInferenceEngine(InferenceEngine):
         if not self.current_batch:
             return InferenceStepResult(outputs)
 
-        requests = self._get_requests_to_process()
+        requests, _ = get_requests_to_process(self.current_batch.values(), self.cache_manager)
         results = self.text_generator.generate(requests, self.cache_manager.get_cache())
         logger.debug("Finished text generation.")
 
@@ -373,50 +375,6 @@ class SynchronousInferenceEngine(InferenceEngine):
 
                 self._discard_cancelled_requests_from_queue()
 
-    def _get_requests_to_process(self):
-        requests = []
-        # TODO: consider having hybrid batch if the underlying attention kernel supports
-        # mixing prefill and decode.
-        is_prompt_batch = any(
-            state.generation_sequences[0].next_start_position == 0
-            for state in self.current_batch.values()
-        )
-
-        if is_prompt_batch:
-            for state in self.current_batch.values():
-                if state.generation_sequences[0].next_start_position == 0:
-                    requests.append(
-                        PrefillRequest(
-                            request_id=state.request_id,
-                            token_ids=state.prompt_token_ids,
-                            num_sequence=state.num_sequences,
-                            sampling_params=state.sampling_params,
-                        )
-                    )
-            logger.debug(
-                "Creating prompt batch with %s requests with %s total tokens.",
-                len(requests),
-                sum(len(r.token_ids) for r in requests),
-            )
-        else:
-            for state in self.current_batch.values():
-                for gen_seq in state.generation_sequences:
-                    if not gen_seq.is_finished:
-                        token_ids = state.prompt_token_ids + gen_seq.generated_token_ids
-                        requests.append(
-                            DecodeRequest(
-                                sequence_id=gen_seq.seq_id,
-                                token_ids=token_ids,
-                                sampling_params=state.sampling_params,
-                            )
-                        )
-                        self.cache_manager.extend(
-                            gen_seq.seq_id,
-                            len(token_ids) - gen_seq.next_start_position,
-                        )
-            logger.debug("Creating decode batch with %s requests.", len(requests))
-
-        return requests
 
     def has_pending_requests(self) -> bool:
         return bool(self.queue or self.current_batch)
@@ -428,31 +386,3 @@ class SynchronousInferenceEngine(InferenceEngine):
         while self.queue and self.queue[0].request_id in self.requests_to_be_cancelled:
             state = self.queue.popleft()
             self.requests_to_be_cancelled.remove(state.request_id)
-
-    def _get_new_request_state(self, request: Request) -> RequestState:
-        if request.debug_options.prompt is not None:
-            prompt = request.debug_options.prompt
-        else:
-            prompt = self.conversation_template.apply(request.messages)
-
-        prompt_tokens = self.tokenizer.encode(prompt)
-
-        gen_seqs = [
-            GenerationSequence(
-                seq_id=SequenceId(request.request_id, i),
-                generated_token_ids=[],
-                next_start_position=0,
-                output_text="",
-            )
-            for i in range(request.num_sequences)
-        ]
-
-        return RequestState(
-            request_id=request.request_id,
-            prompt_token_ids=prompt_tokens,
-            generation_sequences=gen_seqs,
-            sampling_params=request.sampling_params,
-            stopping_criteria=request.stopping_criteria,
-            debug_options=request.debug_options,
-            arrival_timestamp=time.time(),
-        )
