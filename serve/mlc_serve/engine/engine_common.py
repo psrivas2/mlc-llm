@@ -115,14 +115,16 @@ def update_sequence(
 
 def get_requests_to_process(
     current_states: list[RequestState], cache_manager: KVCacheManager
-) -> Tuple[list[Union[PrefillRequest, DecodeRequest]], bool]:
-    requests : list[Union[PrefillRequest, DecodeRequest]] = []
+) -> Tuple[list[Union[PrefillRequest, DecodeRequest]], bool, int]:
+    requests: list[Union[PrefillRequest, DecodeRequest]] = []
     # TODO: consider having hybrid batch if the underlying attention kernel supports
     # mixing prefill and decode.
     is_prompt_batch = any(
         state.generation_sequences[0].next_start_position == 0
         for state in current_states
     )
+
+    token_counts = 0
 
     if is_prompt_batch:
         for state in current_states:
@@ -135,10 +137,13 @@ def get_requests_to_process(
                         sampling_params=state.sampling_params,
                     )
                 )
+
+                token_counts += len(state.prompt_token_ids)
+
         LOG.debug(
             "Creating prompt batch.",
             num_requests=len(requests),
-            total_tokens=sum(len(r.token_ids) for r in requests),
+            total_tokens=token_counts,
         )
     else:
         for state in current_states:
@@ -156,9 +161,11 @@ def get_requests_to_process(
                         gen_seq.seq_id,
                         len(token_ids) - gen_seq.next_start_position,
                     )
-        LOG.debug("Creating decode batch with %s requests.", len(requests))
 
-    return requests, is_prompt_batch
+        token_counts = len(requests)
+        LOG.debug("Creating decode batch with %s requests.", token_counts)
+
+    return requests, is_prompt_batch, token_counts
 
 
 def should_stop_by_length(state: RequestState, max_context_length: int) -> bool:

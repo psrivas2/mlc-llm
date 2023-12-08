@@ -288,20 +288,14 @@ class GenerationLoopWorker(EngineBase):
                 num_new_batched_tokens = self.try_grow_batch(num_new_batched_tokens)
 
     def _get_requests_to_process(self):
-        requests, is_prompt_batch = get_requests_to_process(
+        requests, is_prompt_batch, token_counts = get_requests_to_process(
             self.current_batch.values(), self.cache_manager
         )
 
         if is_prompt_batch:
-            prefill_token_counts = sum([len(req.token_ids) for req in requests])
-            self.prom_metrics.histogram(BATCHED_PREFILL_TOKENS).observe(
-                prefill_token_counts
-            )
+            self.prom_metrics.histogram(BATCHED_PREFILL_TOKENS).observe(token_counts)
         else:
-            decode_token_counts = len(requests)
-            self.prom_metrics.histogram(BATCHED_DECODE_TOKENS).observe(
-                decode_token_counts
-            )
+            self.prom_metrics.histogram(BATCHED_DECODE_TOKENS).observe(token_counts)
 
         return requests, is_prompt_batch
 

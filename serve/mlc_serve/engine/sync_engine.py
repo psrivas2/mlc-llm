@@ -152,7 +152,7 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
         if not self.current_batch:
             return InferenceStepResult(outputs)
 
-        requests, _ = get_requests_to_process(
+        requests, _, _ = get_requests_to_process(
             list(self.current_batch.values()), self.cache_manager
         )
         results = self.text_generator.generate(requests, self.cache_manager.get_cache())
