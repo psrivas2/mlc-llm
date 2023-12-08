@@ -129,11 +129,7 @@ class GenerationLoopWorker(EngineBase):
             )
 
     def has_pending_requests(self) -> bool:
-        return (
-            len(self.queue) != 0
-            or len(self.current_batch) != 0
-            or len(self.cancelled_requests) != 0
-        )
+        return bool(self.queue or self.current_batch or self.cancelled_requests)
 
     def step(self) -> GenerationLoopWorkerOutput:
         LOG.debug("Starting new inference step.")
@@ -300,7 +296,7 @@ class GenerationLoopWorker(EngineBase):
         return requests, is_prompt_batch
 
     def _has_request_to_process(self) -> bool:
-        return len(self.queue) != 0 or len(self.current_batch) != 0
+        return bool(self.queue or self.current_batch)
 
 
 def run_generation_loop_worker(
