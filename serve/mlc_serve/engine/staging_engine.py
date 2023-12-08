@@ -236,6 +236,7 @@ class StagingInferenceEngine(ScopedInferenceEngine):
                 output = SequenceOutput(
                     seq_output.id.sequence_index,
                     delta,
+                    finish_reason=seq_output.finish_reason,
                     num_generated_tokens=len(gen_seq.generated_token_ids),
                 )
 
