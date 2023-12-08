@@ -81,6 +81,8 @@ def decode_last_output(
     else:
         prefix_idx = generation_sequence.next_start_position
 
+    # TODO(masahi): No need to add prompt_token_ids here if we send
+    # the prompt len instead
     token_ids = prompt_tokens + generation_sequence.generated_token_ids
 
     if prefix_idx == 0:
@@ -101,7 +103,7 @@ def update_sequence(
     tokenizer: Tokenizer,
     stopping_criteria: StoppingCriteria,
 ) -> str:
-    gen_seq.next_start_position = len(prompt_token_ids + gen_seq.generated_token_ids)
+    gen_seq.next_start_position = len(prompt_token_ids) + len(gen_seq.generated_token_ids)
     gen_seq.generated_token_ids.extend(new_token_ids)
     delta = decode_last_output(prompt_token_ids, gen_seq, tokenizer)
     gen_seq.output_text += delta
@@ -149,6 +151,8 @@ def get_requests_to_process(
         for state in current_states:
             for gen_seq in state.generation_sequences:
                 if not gen_seq.is_finished:
+                    # TODO(masahi): No need to add prompt_token_ids here if we send
+                    # the prompt len instead
                     token_ids = state.prompt_token_ids + gen_seq.generated_token_ids
                     requests.append(
                         DecodeRequest(
@@ -176,7 +180,7 @@ def should_stop_by_length(state: RequestState, max_context_length: int) -> bool:
         if gen_seq.is_finished:
             continue
 
-        num_context_tokens = len(state.prompt_token_ids + gen_seq.generated_token_ids)
+        num_context_tokens = state.prompt_len + len(gen_seq.generated_token_ids)
         if num_context_tokens >= max_context_length:
             gen_seq.is_finished = True
             continue
