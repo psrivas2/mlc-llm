@@ -81,8 +81,7 @@ def decode_last_output(
     else:
         prefix_idx = generation_sequence.next_start_position
 
-    # TODO(masahi): No need to add prompt_token_ids here if we send
-    # the prompt len instead
+    # TODO(masahi): Figure out a way to remove this concat
     token_ids = prompt_tokens + generation_sequence.generated_token_ids
 
     if prefix_idx == 0:
