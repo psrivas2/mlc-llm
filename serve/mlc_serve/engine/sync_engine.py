@@ -4,7 +4,7 @@ A implementation of InferenceEngine that executes in the current process.
 
 import logging
 from collections import defaultdict
-from typing import Set, DefaultDict
+from typing import Set
 
 from .base import (
     FinishReason,
@@ -177,7 +177,7 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
             else:
                 valid_results.append(res)
 
-        seq_outputs: DefaultDict[RequestId, list[SequenceOutput]] = defaultdict(list)
+        seq_outputs = defaultdict(list)
 
         for res in valid_results:
             request_id = res.sequence_id.request_id
