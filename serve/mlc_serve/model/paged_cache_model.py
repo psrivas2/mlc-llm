@@ -55,6 +55,13 @@ class KVCache:
         self.slot_mappings = defaultdict(list)
 
 
+PROMPT_SEQEUNCE_INDEX = -1
+
+
+def get_prompt_sequence_id(request_id: RequestId) -> SequenceId:
+    return SequenceId(request_id, PROMPT_SEQEUNCE_INDEX)
+
+
 class CacheManager:
     block_size: int = 16
 
@@ -81,7 +88,8 @@ class CacheManager:
         self.kv_cache = KVCache(
             num_blocks, self.block_size, num_layers, num_heads, head_size, disco_session
         )
-        self.allocated_tokens = dict[SequenceId, int]()
+        self.allocated_prompt_tokens = dict[SequenceId, int]()
+        self.allocated_decode_tokens = dict[SequenceId, int]()
 
         if sliding_window:
             assert sliding_window % self.kv_cache.block_size == 0
@@ -155,34 +163,45 @@ class CacheManager:
     def get_cache(self):
         return self.kv_cache
 
-    def allocate(self, request_id: RequestId, num_tokens: int):
+    def allocate(self, request_id: RequestId, num_tokens: int, num_sequences: int):
         """
         Allocate cache space for a prefill request, raise error if there is no space.
         """
-        prompt_seq_id = SequenceId(request_id, 0)
+        prompt_seq_id = get_prompt_sequence_id(request_id)
         self.set_size([prompt_seq_id], [num_tokens])
-        self.allocated_tokens[prompt_seq_id] = num_tokens
+        self.allocated_prompt_tokens[prompt_seq_id] = num_tokens
+
+        for i in range(num_sequences):
+            decode_seq_id = SequenceId(request_id, i)
+            # TODO: Copy partially shared prompt blocks
+            self.allocated_decode_tokens[decode_seq_id] = 0
+            # Prepend the block table for prompt to avoid frequent concat later
+            self.kv_cache.block_tables[decode_seq_id] = self.kv_cache.block_tables[prompt_seq_id]
 
     def extend(self, sequence_id: SequenceId, new_tokens: int):
         """
         Extend cache space for a sequence, raise error if there is no space.
         """
-        assert sequence_id.sequence_index == 0, "multiple sequences not supported"
         # TODO parallel sampling: How to accomodate shared prompt tokens
-        allocated = self.allocated_tokens[sequence_id]
+        prompt_seq_id = get_prompt_sequence_id(sequence_id.request_id)
+        allocated = self.allocated_prompt_tokens[prompt_seq_id] + self.allocated_decode_tokens[sequence_id]
         self.set_size([sequence_id], [allocated + new_tokens])
-        self.allocated_tokens[sequence_id] += new_tokens
+        self.allocated_decode_tokens[sequence_id] += new_tokens
 
     def free(self, sequence_id: SequenceId):
         """
         Free cache space for a sequence in a request.
         """
         assert sequence_id.sequence_index == 0, "multiple sequences not supported"
-        if sequence_id in self.allocated_tokens:
-            # TODO parallel sampling: Prompt tokens should not be freed until all
-            # generation sequences in the same sample are freed.
-            del self.allocated_tokens[sequence_id]
+        if sequence_id in self.allocated_decode_tokens:
+            del self.allocated_decode_tokens[sequence_id]
             self.set_size([sequence_id], [0])
+
+            # TODO: Decrement prompt tokens ref count or free it
+            if False:
+                prompt_seq_id = get_prompt_sequence_id(sequence_id.request_id)
+                del self.allocated_prompt_tokens[prompt_seq_id]
+                self.set_size([prompt_seq_id], [0])
 
     def free_request(self, state: RequestState):
         """
@@ -219,18 +238,16 @@ class CacheManager:
         It should return the result of `get_kv_cache_size` if there is
         no requests in the cache.
         """
-        if not self.allocated_tokens:
+        if not self.allocated_decode_tokens:
             return len(self.free_blocks) * self.block_size
 
-        free_blocks_per_sequence = len(self.free_blocks) // len(self.allocated_tokens)
+        free_blocks_per_sequence = len(self.free_blocks) // len(self.allocated_decode_tokens)
         remaining_blocks = len(self.free_blocks) - free_blocks_per_sequence * len(
-            self.allocated_tokens
+            self.allocated_decode_tokens
         )
-        # The number of shared prompt tokens in parallel sampling is divisible by block_size,
-        # so this calculation should be valid for parallel sampling as well.
         remaining_tokens_in_last_block = [
             self.block_size - (tokens - 1) % self.block_size - 1
-            for tokens in self.allocated_tokens.values()
+            for tokens in self.allocated_decode_tokens.values()
         ]
 
         return (
@@ -378,6 +395,7 @@ def get_tvm_model(config, dev):
 def _prepare_inputs(
     sequence_ids,
     all_token_ids,
+    prompt_lens,
     all_slot_mappings,
     all_block_tables,
     sliding_window,
@@ -393,7 +411,7 @@ def _prepare_inputs(
     indices_within_window = []
     start_idx = 0
 
-    for sequence_id, token_ids in zip(sequence_ids, all_token_ids):
+    for i, (sequence_id, token_ids) in enumerate(zip(sequence_ids, all_token_ids)):
         if is_prefill:
             input_ids += token_ids
             prompt_len = len(token_ids)
@@ -410,17 +428,17 @@ def _prepare_inputs(
 
         else:
             input_ids.append(token_ids[-1])
-            pos = len(token_ids) - 1
-            positions.append(pos)
+            seq_len = prompt_lens[i] + len(token_ids)
+            positions.append(seq_len - 1)
             block_table = all_block_tables[sequence_id]
             max_num_blocks_per_seq = max(max_num_blocks_per_seq, len(block_table))
             block_tables.append(block_table)
             slot_mapping.append(all_slot_mappings[sequence_id][-1])
 
             if sliding_window:
-                seq_lens.append(min(len(token_ids), sliding_window))
+                seq_lens.append(min(seq_len, sliding_window))
             else:
-                seq_lens.append(len(token_ids))
+                seq_lens.append(seq_len)
 
     def to_ndarray_via_torch(arr, torch_dtype):
         return tvm.nd.from_dlpack(torch.tensor(arr, dtype=torch_dtype, device="cuda"))
@@ -538,12 +556,14 @@ class Model:
         all_token_ids = []
         sampling_params = []
         sequence_ids = []
+        prompt_lens = []
 
         for request in requests:
             if isinstance(request, PrefillRequest):
-                sequence_ids.append(SequenceId(request.request_id, 0))
+                sequence_ids.append(get_prompt_sequence_id(request.request_id))
             else:
                 sequence_ids.append(request.sequence_id)
+                prompt_lens.append(request.prompt_token_counts)
 
             all_token_ids.append(request.token_ids)
             sampling_params.append(request.sampling_params)
@@ -558,6 +578,7 @@ class Model:
         ) = _prepare_inputs(
             sequence_ids,
             all_token_ids,
+            prompt_lens,
             cache.slot_mappings,
             cache.block_tables,
             self.sliding_window,

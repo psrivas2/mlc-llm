@@ -166,19 +166,18 @@ def get_requests_to_process(
         for state in current_states:
             for gen_seq in state.generation_sequences:
                 if not gen_seq.is_finished:
-                    # TODO(masahi): No need to add prompt_token_ids here if we send
-                    # the prompt len instead
-                    token_ids = state.prompt_token_ids + gen_seq.generated_token_ids
+                    prompt_counts = len(state.prompt_token_ids)
                     requests.append(
                         DecodeRequest(
                             sequence_id=gen_seq.seq_id,
-                            token_ids=token_ids,
+                            prompt_token_counts=prompt_counts,
+                            token_ids=gen_seq.generated_token_ids,
                             sampling_params=state.sampling_params,
                         )
                     )
                     cache_manager.extend(
                         gen_seq.seq_id,
-                        len(token_ids) - gen_seq.next_start_position,
+                        prompt_counts + len(gen_seq.generated_token_ids) - gen_seq.next_start_position,
                     )
 
         token_counts = len(requests)
@@ -346,7 +345,7 @@ class EngineBase:
 
         self.queue.popleft()
         # TODO parallel sampling: Need update here when evicting multi-sequence requests is supported.
-        self.cache_manager.allocate(state.request_id, num_tokens)
+        self.cache_manager.allocate(state.request_id, num_tokens, state.num_sequences)
         self.current_batch[state.request_id] = state
 
         return num_new_batched_tokens
