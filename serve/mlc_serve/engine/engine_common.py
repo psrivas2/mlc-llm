@@ -118,7 +118,9 @@ def update_sequence(
     tokenizer: Tokenizer,
     stopping_criteria: StoppingCriteria,
 ) -> str:
-    gen_seq.next_start_position = len(prompt_token_ids) + len(gen_seq.generated_token_ids)
+    gen_seq.next_start_position = len(prompt_token_ids) + len(
+        gen_seq.generated_token_ids
+    )
     gen_seq.generated_token_ids.extend(new_token_ids)
     delta = decode_last_output(prompt_token_ids, gen_seq, tokenizer)
     gen_seq.output_text += delta
@@ -177,7 +179,9 @@ def get_requests_to_process(
                     )
                     cache_manager.extend(
                         gen_seq.seq_id,
-                        prompt_counts + len(gen_seq.generated_token_ids) - gen_seq.next_start_position,
+                        prompt_counts
+                        + len(gen_seq.generated_token_ids)
+                        - gen_seq.next_start_position,
                     )
 
         token_counts = len(requests)
