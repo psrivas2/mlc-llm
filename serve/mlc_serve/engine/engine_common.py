@@ -173,6 +173,9 @@ def should_stop_by_length(state: RequestState, max_context_length: int) -> bool:
     # TODO: currently, we simply return true for both stopping reasons.
     #       in the future, we can differentiate these two.
     # this include prompt tokens and gen tokens so far
+    if state.is_finished:
+        return False
+
     for gen_seq in state.generation_sequences:
         if gen_seq.is_finished:
             continue
