@@ -97,6 +97,8 @@ class CacheManager:
         else:
             self.block_sliding_window = None
 
+        self.pending_copy_from_to = []
+
     def set_size(self, sequence_ids: List[SequenceId], target_sizes: List[int]):
         for id, size in zip(sequence_ids, target_sizes):
             num_needed_block = math.ceil(size / self.block_size)
@@ -171,18 +173,37 @@ class CacheManager:
         self.set_size([prompt_seq_id], [num_tokens])
         self.allocated_prompt_tokens[prompt_seq_id] = num_tokens
 
+        last_block_partially_shared = num_sequences > 1 and (num_tokens % self.block_size != 0)
+
+        if last_block_partially_shared:
+            self.allocated_prompt_tokens[prompt_seq_id] -= num_tokens % self.block_size
+
         for i in range(num_sequences):
             decode_seq_id = SequenceId(request_id, i)
-            # TODO: Copy partially shared prompt blocks
-            self.allocated_decode_tokens[decode_seq_id] = 0
-            # Prepend the block table for prompt to avoid frequent concat later
-            self.kv_cache.block_tables[decode_seq_id] = self.kv_cache.block_tables[prompt_seq_id]
+
+            if not last_block_partially_shared:
+                self.allocated_decode_tokens[decode_seq_id] = 0
+                # Prepend the block table for prompt to avoid frequent concat later
+                self.kv_cache.block_tables[decode_seq_id] = self.kv_cache.block_tables[prompt_seq_id]
+            else:
+                # Tokens in the partially-shared prompt block are considered to be part of each decode sequence
+                self.allocated_decode_tokens[decode_seq_id] = num_tokens % self.block_size
+
+                if i < num_sequences:
+                    # Need to copy the last block in self.kv_cache.block_tables[prompt_seq_id]
+                    self.kv_cache.block_tables[decode_seq_id] = self.kv_cache.block_tables[prompt_seq_id][:-1]
+                    last_block_copy = self.free_blocks.pop()
+                    self.kv_cache.block_tables[decode_seq_id].append(last_block_copy)
+                    self.pending_copy_from_to.append((self.kv_cache.block_tables[prompt_seq_id][-1], last_block_copy))
+                else:
+                    # The last sequence can directly overwrite the last block without copying it,
+                    # since other sequences have its own copy of the last block.
+                    self.kv_cache.block_tables[decode_seq_id] = self.kv_cache.block_tables[prompt_seq_id]
 
     def extend(self, sequence_id: SequenceId, new_tokens: int):
         """
         Extend cache space for a sequence, raise error if there is no space.
         """
-        # TODO parallel sampling: How to accomodate shared prompt tokens
         prompt_seq_id = get_prompt_sequence_id(sequence_id.request_id)
         allocated = self.allocated_prompt_tokens[prompt_seq_id] + self.allocated_decode_tokens[sequence_id]
         self.set_size([sequence_id], [allocated + new_tokens])
