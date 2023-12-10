@@ -110,7 +110,8 @@ class CacheManager:
             if id in self.kv_cache.block_tables and size == 0:
                 self.free_blocks.extend(self.kv_cache.block_tables[id])
                 del self.kv_cache.block_tables[id]
-                del self.kv_cache.slot_mappings[id]
+                if id in self.kv_cache.slot_mappings:
+                    del self.kv_cache.slot_mappings[id]
 
             elif id in self.kv_cache.block_tables:
                 # Decoding
@@ -238,6 +239,7 @@ class CacheManager:
             self.num_running_sequences[prompt_seq_id] -= 1
 
             if self.num_running_sequences[prompt_seq_id] == 0:
+                del self.num_running_sequences[prompt_seq_id]
                 del self.allocated_prompt_tokens[prompt_seq_id]
                 self.set_size([prompt_seq_id], [0])
 
