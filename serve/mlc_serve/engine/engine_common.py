@@ -18,8 +18,6 @@ from .base import (
     StoppingCriteria,
     check_stopping_sequences,
 )
-from .metrics import PrometheusMetrics
-from .metrics_labels import NUM_CACHE_EVICTONS
 from .model_module import (
     DecodeRequest,
     PrefillRequest,
@@ -232,9 +230,6 @@ class EngineBase:
 
         self.current_batch = dict[RequestId, RequestState]()
 
-        self.prom_metrics = PrometheusMetrics()
-        self.inv_kv_cache_size = 1.0 / self.cache_manager.get_kv_cache_size()
-
     def check_prompt_too_long(self, prompt_len: int, num_sequences: int = 1) -> bool:
         kv_cache_size = self.cache_manager.get_kv_cache_size()
         max_prompt_len = min(self.max_context_length, self.max_num_batched_tokens)
@@ -246,9 +241,11 @@ class EngineBase:
             or (kv_cache_size - prompt_len) < self.max_decode_steps * num_sequences
         )
 
-    def evict_request(self):
+    def evict_request(self) -> int:
+        num_eviction = 0
+
         while self.cache_manager.get_max_new_tokens() < 1:
-            self.prom_metrics.counter(NUM_CACHE_EVICTONS).inc()
+            num_eviction += 1
             request_to_remove = min(
                 self.current_batch.values(), key=lambda s: s.num_total_tokens
             )
@@ -264,6 +261,8 @@ class EngineBase:
                 "Preempt request to free %s tokens",
                 request_to_remove.num_total_tokens,
             )
+
+        return num_eviction
 
     def try_grow_batch(self, num_new_batched_tokens) -> Optional[int]:
         max_new_tokens = self.cache_manager.get_max_new_tokens()

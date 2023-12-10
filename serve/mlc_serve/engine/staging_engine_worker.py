@@ -11,6 +11,7 @@ from typing import Callable, Optional, Union, Any, Dict, List
 import structlog
 
 from .base import FinishReason, RequestId, RequestState, ValidationError, SequenceId
+from .metrics import PrometheusMetrics
 from .metrics_labels import *
 from .model_module import (
     ModelModule,
@@ -67,6 +68,8 @@ class GenerationLoopWorkerOutput:
 class GenerationLoopWorker(EngineBase):
     cancelled_requests: List[RequestState]
     stopped_requests: List[RequestState]
+    prom_metrics: PrometheusMetrics
+    inv_kv_cache_size: float
 
     def __init__(
         self,
@@ -76,6 +79,9 @@ class GenerationLoopWorker(EngineBase):
 
         self.cancelled_requests = list[RequestState]()
         self.stopped_requests = list[RequestState]()
+
+        self.prom_metrics = PrometheusMetrics()
+        self.inv_kv_cache_size = 1.0 / self.cache_manager.get_kv_cache_size()
 
     def add(self, request_states: list[RequestState]):
         LOG.debug("GenerationLoopWorker", requests_states=request_states)
@@ -236,7 +242,9 @@ class GenerationLoopWorker(EngineBase):
             gen_seq = state.generation_sequences[seq_index]
             new_tokens = res.generated_tokens
 
-            gen_seq.next_start_position = state.prompt_len + len(gen_seq.generated_token_ids)
+            gen_seq.next_start_position = state.prompt_len + len(
+                gen_seq.generated_token_ids
+            )
 
             # Need to match at the token-id level
             for i, token_id in enumerate(new_tokens):
@@ -267,7 +275,8 @@ class GenerationLoopWorker(EngineBase):
 
     def _adjust_batch(self):
         with self.queue_lock:
-            self.evict_request()
+            num_eviction = self.evict_request()
+            self.prom_metrics.counter(NUM_CACHE_EVICTONS).inc(num_eviction)
 
             if self.cache_manager.get_max_new_tokens() <= self.max_decode_steps:
                 LOG.debug(
