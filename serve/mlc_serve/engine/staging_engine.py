@@ -6,6 +6,7 @@ import multiprocessing
 import queue
 from threading import Lock
 from typing import Callable
+from collections import defaultdict
 
 import structlog
 
@@ -192,9 +193,8 @@ class StagingInferenceEngine(ScopedInferenceEngine):
                 generation_output=generation_output,
             )
 
-            out_seqs: list[SequenceOutput] = []
-            prev_request_id = None
-            prev_prompt_len = None
+            seq_outputs = defaultdict(list)
+            prompt_len = {}
 
             for seq_output in generation_output.sequences:
                 request_id = seq_output.id.request_id
@@ -229,49 +229,31 @@ class StagingInferenceEngine(ScopedInferenceEngine):
                     state.stopping_criteria,
                 )
 
-                if prev_request_id is not None and prev_request_id != request_id:
-                    # The returned sequences are ordered by requests.
-                    # When prev_request_id != request_id, all samples for prev_request_id
-                    # have been collected in out_seqs.
-                    assert len(out_seqs) > 0 and prev_prompt_len is not None
-                    outputs.append(
-                        RequestOutput(
-                            prev_request_id,
-                            sequences=out_seqs,
-                            num_prompt_tokens=prev_prompt_len,
-                        )
-                    )
-                    out_seqs = []
-
-                out_seqs.append(
-                    SequenceOutput(
-                        seq_output.id.sequence_index,
-                        delta,
-                        finish_reason=seq_output.finish_reason,
-                        num_generated_tokens=len(gen_seq.generated_token_ids),
-                    )
-                )
-
-                prev_request_id = request_id
-                prev_prompt_len = state.prompt_len
-
                 # signal workers to stop generation
                 if state.is_finished:
                     self.stop_request(state.request_id)
 
+                output = SequenceOutput(
+                    seq_output.id.sequence_index,
+                    delta,
+                    finish_reason=seq_output.finish_reason,
+                    num_generated_tokens=len(gen_seq.generated_token_ids),
+                )
+
+                seq_outputs[request_id].append(output)
+                prompt_len[request_id] = state.prompt_len
+
                 if seq_output.finish_reason is not None:
                     del self.requests[request_id]
 
-            assert prev_request_id and len(out_seqs) > 0 and prev_prompt_len is not None
-
-            # Add output sequences for the last request.
-            outputs.append(
-                RequestOutput(
-                    prev_request_id,
-                    sequences=out_seqs,
-                    num_prompt_tokens=prev_prompt_len,
+            for request_id, out_seqs in seq_outputs.items():
+                outputs.append(
+                    RequestOutput(
+                        request_id,
+                        sequences=out_seqs,
+                        num_prompt_tokens=prompt_len[request_id],
+                    )
                 )
-            )
 
         return InferenceStepResult(outputs=outputs)
 
