@@ -189,6 +189,7 @@ class CacheManager:
             if not last_block_partially_shared:
                 self.allocated_decode_tokens[decode_seq_id] = 0
                 # Prepend the block table for prompt to avoid frequent concat later
+                # TODO: Need update for SWA
                 self.kv_cache.block_tables[decode_seq_id] = self.kv_cache.block_tables[
                     prompt_seq_id
                 ]
@@ -232,10 +233,15 @@ class CacheManager:
         Free cache space for a sequence in a request.
         """
         if sequence_id in self.allocated_decode_tokens:
+            prompt_seq_id = get_prompt_sequence_id(sequence_id.request_id)
+
             del self.allocated_decode_tokens[sequence_id]
+            # TODO: Need update for SWA
+            self.kv_cache.block_tables[sequence_id] = self.kv_cache.block_tables[
+                sequence_id
+            ][len(self.kv_cache.block_tables[prompt_seq_id]) :]
             self.set_size([sequence_id], [0])
 
-            prompt_seq_id = get_prompt_sequence_id(sequence_id.request_id)
             self.num_running_sequences[prompt_seq_id] -= 1
 
             if self.num_running_sequences[prompt_seq_id] == 0:
