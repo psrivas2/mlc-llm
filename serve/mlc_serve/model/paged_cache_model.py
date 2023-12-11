@@ -34,6 +34,44 @@ from ..engine.model_module import ModelModule
 LOG = structlog.stdlib.get_logger(__name__)
 
 
+class DecodeBlockTable:
+    def __init__(self, prompt_blocks: list[int]):
+        self.prompt_cursor = 0
+        self.num_prompt_blocks = len(prompt_blocks)
+        # Prompt blocks between [prompt_cursor, self.num_prompt_blocks) are shared
+        # with other sequences in a parallel-sampling request.
+        self.prompt_blocks = prompt_blocks  # immutable
+        self.decode_blocks = []
+
+    def append(self, new_block_id):
+        self.decode_blocks.append(new_block_id)
+
+    def __len__(self):
+        return self.num_prompt_blocks - self.prompt_cursor + len(self.decode_blocks)
+
+    def __getitem__(self, index: int):
+        if index == -1:
+            if len(self.decode_blocks) == 0:
+                return self.prompt_blocks[-1], True
+
+            return self.decode_blocks[-1], False
+
+        assert index >= 0
+
+        if index < self.num_prompt_blocks:
+            return self.prompt_blocks[self.prompt_cursor + index], True
+
+        return self.decode_blocks[index - self.num_prompt_blocks], False
+
+    def get_blocks(self):
+        return self.prompt_blocks[self.prompt_cursor :] + self.decode_blocks
+
+    def replace_head_prompt_block_with(self, new_block):
+        self.append(new_block)
+        self.prompt_cursor += 1
+        self.num_prompt_blocks -= 1
+
+
 class KVCache:
     def __init__(
         self, num_blocks, block_size, num_layers, num_heads, head_size, disco_session
@@ -58,7 +96,10 @@ class KVCache:
         self.block_size = block_size
 
         # SequenceId -> list[int]
-        self.block_tables = defaultdict(list)
+        self.prompt_block_tables = defaultdict(list)
+        # Ref counts are initialized and used only for SWA + parallel sampling requests
+        self.prompt_blocks_ref_counts = defaultdict(list)
+        self.decode_block_tables = dict()
         self.slot_mappings = defaultdict(list)
 
         self.pending_copy_from_to = []
@@ -114,46 +155,67 @@ class CacheManager:
             if self.block_sliding_window:
                 num_needed_block = min(num_needed_block, self.block_sliding_window)
 
-            if id in self.kv_cache.block_tables and size == 0:
-                self.free_blocks.extend(self.kv_cache.block_tables[id])
-                del self.kv_cache.block_tables[id]
+            if size == 0:
+                if id in self.kv_cache.prompt_block_tables:
+                    self.free_blocks.extend(self.kv_cache.prompt_block_tables[id])
+                    del self.kv_cache.prompt_block_tables[id]
+                    if id in self.kv_cache.prompt_blocks_ref_counts:
+                        del self.kv_cache.prompt_blocks_ref_counts[id]
+                elif id in self.kv_cache.decode_block_tables:
+                    self.free_blocks.extend(
+                        self.kv_cache.decode_block_tables[id].decode_blocks
+                    )
+                    del self.kv_cache.decode_block_tables[id]
+
                 if id in self.kv_cache.slot_mappings:
                     del self.kv_cache.slot_mappings[id]
 
-            elif id in self.kv_cache.block_tables:
-                # Decoding
-                if len(self.kv_cache.block_tables[id]) < num_needed_block:
+            elif id in self.kv_cache.decode_block_tables:
+                decode_block_table = self.kv_cache.decode_block_tables[id]
+                if len(decode_block_table) < num_needed_block:
                     # Need to allocate a new block for this request
-                    assert len(self.kv_cache.block_tables[id]) + 1 == num_needed_block
-                    self.kv_cache.block_tables[id].append(self.free_blocks.pop())
+                    assert len(decode_block_table) + 1 == num_needed_block
+                    decode_block_table.append(self.free_blocks.pop())
 
                 pos = size - 1
-                block_number = self.kv_cache.block_tables[id][-1]
 
                 if self.block_sliding_window:
-                    block_number = self.kv_cache.block_tables[id][
-                        (pos // self.block_size) % self.block_sliding_window
-                    ]
+                    index = (pos // self.block_size) % self.block_sliding_window
                 else:
-                    block_number = self.kv_cache.block_tables[id][-1]
+                    index = -1
+
+                block_number, is_prompt = decode_block_table[index]
+
+                if (
+                    is_prompt
+                    and self.block_sliding_window
+                    and len(self.kv_cache.prompt_blocks_ref_counts[id]) > 0
+                    and self.kv_cache.prompt_blocks_ref_counts[id][index] > 1
+                ):
+                    self.kv_cache.prompt_blocks_ref_counts[id][index] -= 1
+                    # TODO(masahi): The engine should take into account this additional
+                    # free block allocation requirment.
+                    assert len(self.free_blocks) > 0, "No more free block in the cache."
+                    block_number = self.free_blocks.pop()
+                    decode_block_table.replace_head_prompt_block_with(block_number)
 
                 block_offset = pos % self.block_size
                 slot = block_number * self.block_size + block_offset
                 self.kv_cache.slot_mappings[id].append(slot)
 
-            elif id not in self.kv_cache.block_tables:
+            elif id not in self.kv_cache.prompt_block_tables:
                 assert (
                     len(self.free_blocks) >= num_needed_block
                 ), "Not enough free blocks."
 
                 for _ in range(num_needed_block):
-                    self.kv_cache.block_tables[id].append(self.free_blocks.pop())
+                    self.kv_cache.prompt_block_tables[id].append(self.free_blocks.pop())
 
                 for block_idx in range(math.floor(size / self.block_size)):
                     if self.block_sliding_window:
                         block_idx %= self.block_sliding_window
 
-                    block_number = self.kv_cache.block_tables[id][block_idx]
+                    block_number = self.kv_cache.prompt_block_tables[id][block_idx]
                     slots = [
                         block_number * self.block_size + block_offset
                         for block_offset in range(self.block_size)
@@ -166,7 +228,7 @@ class CacheManager:
                     if self.block_sliding_window:
                         block_idx %= self.block_sliding_window
 
-                    block_number = self.kv_cache.block_tables[id][block_idx]
+                    block_number = self.kv_cache.prompt_block_tables[id][block_idx]
                     block_offset = i % self.block_size
                     slot = block_number * self.block_size + block_offset
                     self.kv_cache.slot_mappings[id].append(slot)
@@ -190,15 +252,21 @@ class CacheManager:
         if last_block_partially_shared:
             self.allocated_prompt_tokens[prompt_seq_id] -= num_tokens % self.block_size
 
+        prompt_blocks = self.kv_cache.prompt_block_tables[prompt_seq_id]
+        assert prompt_blocks
+
+        if self.block_sliding_window and num_sequences > 1:
+            self.kv_cache.prompt_blocks_ref_counts[prompt_seq_id] = [
+                num_sequences
+            ] * len(prompt_blocks)
+
         for i in range(num_sequences):
             decode_seq_id = SequenceId(request_id, i)
 
             if not last_block_partially_shared:
                 self.allocated_decode_tokens[decode_seq_id] = 0
-                # Prepend the block table for prompt to avoid frequent concat later
-                # TODO: Need update for SWA
-                self.kv_cache.block_tables[decode_seq_id] = copy.copy(
-                    self.kv_cache.block_tables[prompt_seq_id]
+                self.kv_cache.decode_block_tables[decode_seq_id] = DecodeBlockTable(
+                    prompt_blocks
                 )
             else:
                 # Tokens in the partially-shared prompt block are considered to be part of each decode sequence
@@ -208,19 +276,21 @@ class CacheManager:
 
                 if i < num_sequences:
                     # Need to copy the last block in self.kv_cache.block_tables[prompt_seq_id]
-                    self.kv_cache.block_tables[decode_seq_id] = copy.copy(
-                        self.kv_cache.block_tables[prompt_seq_id][:-1]
+                    self.kv_cache.decode_block_tables[decode_seq_id] = DecodeBlockTable(
+                        prompt_blocks[:-1]
                     )
                     last_block_copy = self.free_blocks.pop()
-                    self.kv_cache.block_tables[decode_seq_id].append(last_block_copy)
+                    self.kv_cache.decode_block_tables[decode_seq_id].append(
+                        last_block_copy
+                    )
                     self.kv_cache.pending_copy_from_to.extend(
-                        [self.kv_cache.block_tables[prompt_seq_id][-1], last_block_copy]
+                        [prompt_blocks[-1], last_block_copy]
                     )
                 else:
                     # The last sequence can directly overwrite the last block without copying it,
                     # since other sequences have its own copy of the last block.
-                    self.kv_cache.block_tables[decode_seq_id] = copy.copy(
-                        self.kv_cache.block_tables[prompt_seq_id]
+                    self.kv_cache.decode_block_tables[decode_seq_id] = DecodeBlockTable(
+                        prompt_blocks
                     )
 
     def extend(self, sequence_id: SequenceId, new_tokens: int):
@@ -240,15 +310,10 @@ class CacheManager:
         Free cache space for a sequence in a request.
         """
         if sequence_id in self.allocated_decode_tokens:
-            prompt_seq_id = get_prompt_sequence_id(sequence_id.request_id)
-
             del self.allocated_decode_tokens[sequence_id]
-            # TODO: Need update for SWA
-            self.kv_cache.block_tables[sequence_id] = self.kv_cache.block_tables[
-                sequence_id
-            ][len(self.kv_cache.block_tables[prompt_seq_id]) :]
             self.set_size([sequence_id], [0])
 
+            prompt_seq_id = get_prompt_sequence_id(sequence_id.request_id)
             self.num_running_sequences[prompt_seq_id] -= 1
 
             if self.num_running_sequences[prompt_seq_id] == 0:
@@ -458,7 +523,7 @@ def _prepare_inputs(
     all_token_ids,
     prompt_lens,
     all_slot_mappings,
-    all_block_tables,
+    all_decode_block_tables,
     sliding_window,
     is_prefill,
 ):
@@ -490,9 +555,9 @@ def _prepare_inputs(
             input_ids.append(token_ids[-1])
             seq_len = prompt_lens[i] + len(token_ids)
             positions.append(seq_len - 1)
-            block_table = all_block_tables[sequence_id]
+            block_table = all_decode_block_tables[sequence_id]
             max_num_blocks_per_seq = max(max_num_blocks_per_seq, len(block_table))
-            block_tables.append(block_table)
+            block_tables.append(block_table.get_blocks())
             slot_mapping.append(all_slot_mappings[sequence_id][-1])
 
             if sliding_window:
@@ -641,7 +706,7 @@ class Model:
             all_token_ids,
             prompt_lens,
             cache.slot_mappings,
-            cache.block_tables,
+            cache.decode_block_tables,
             self.sliding_window,
             is_prefill,
         )
