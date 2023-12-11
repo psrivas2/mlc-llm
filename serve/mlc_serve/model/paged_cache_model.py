@@ -1,5 +1,6 @@
 import math
 import os
+import copy
 from collections import defaultdict
 from typing import List, Union, Optional
 from pathlib import Path
@@ -190,9 +191,9 @@ class CacheManager:
                 self.allocated_decode_tokens[decode_seq_id] = 0
                 # Prepend the block table for prompt to avoid frequent concat later
                 # TODO: Need update for SWA
-                self.kv_cache.block_tables[decode_seq_id] = self.kv_cache.block_tables[
-                    prompt_seq_id
-                ]
+                self.kv_cache.block_tables[decode_seq_id] = copy.copy(
+                    self.kv_cache.block_tables[prompt_seq_id]
+                )
             else:
                 assert False
                 # Tokens in the partially-shared prompt block are considered to be part of each decode sequence
@@ -202,9 +203,9 @@ class CacheManager:
 
                 if i < num_sequences:
                     # Need to copy the last block in self.kv_cache.block_tables[prompt_seq_id]
-                    self.kv_cache.block_tables[
-                        decode_seq_id
-                    ] = self.kv_cache.block_tables[prompt_seq_id][:-1]
+                    self.kv_cache.block_tables[decode_seq_id] = copy.copy(
+                        self.kv_cache.block_tables[prompt_seq_id][:-1]
+                    )
                     last_block_copy = self.free_blocks.pop()
                     self.kv_cache.block_tables[decode_seq_id].append(last_block_copy)
                     self.pending_copy_from_to.append(
@@ -213,9 +214,9 @@ class CacheManager:
                 else:
                     # The last sequence can directly overwrite the last block without copying it,
                     # since other sequences have its own copy of the last block.
-                    self.kv_cache.block_tables[
-                        decode_seq_id
-                    ] = self.kv_cache.block_tables[prompt_seq_id]
+                    self.kv_cache.block_tables[decode_seq_id] = copy.copy(
+                        self.kv_cache.block_tables[prompt_seq_id]
+                    )
 
     def extend(self, sequence_id: SequenceId, new_tokens: int):
         """
@@ -448,7 +449,6 @@ def _prepare_inputs(
     all_slot_mappings,
     all_block_tables,
     sliding_window,
-    dev,
     is_prefill,
 ):
     block_tables = []
@@ -511,7 +511,6 @@ def _prepare_inputs(
             _pad_to_max(block_table, max_num_blocks_per_seq)
             for block_table in block_tables
         ]
-
         block_tables = to_ndarray_via_torch(padded_block_tables, torch.int)
     else:
         block_tables = None
@@ -633,7 +632,6 @@ class Model:
             cache.slot_mappings,
             cache.block_tables,
             self.sliding_window,
-            self.dev,
             is_prefill,
         )
 
