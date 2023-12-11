@@ -434,6 +434,12 @@ def copy_to_worker_0(sess: di.Session, host_array):
     return x_array
 
 
+def broadcast_from_worker_0(sess: di.Session, src, shape, dtype):
+    dst = sess.empty(shape, dtype)
+    sess.broadcast_from_worker0(src, dst)
+    return dst
+
+
 def get_tvm_model(config, dev):
     LOG.info(f"Loading parameters from {config.model_artifact_path}.")
     lib_path = os.path.join(config.model_artifact_path, config.library_name)
@@ -703,9 +709,20 @@ class Model:
         torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
-        if is_prefill:
-            block_mapping = tvm.nd.array(np.array(cache.pending_copy_from_to, dtype="int64"))
+        if is_prefill and cache.pending_copy_from_to:
+            block_mapping = tvm.nd.array(
+                np.array(cache.pending_copy_from_to, dtype="int64")
+            )
             assert cache.copy_cache_blocks_func
+
+            if self.disco_session:
+                block_mapping = broadcast_from_worker_0(
+                    self.disco_session,
+                    copy_to_worker_0(self.disco_session, block_mapping),
+                    block_mapping.shape,
+                    "int64",
+                )
+
             cache.copy_cache_blocks_func(kv_cache, block_mapping)
             cache.pending_copy_from_to = []
 
