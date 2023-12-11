@@ -41,7 +41,7 @@ class DecodeBlockTable:
         # Prompt blocks between [prompt_cursor, self.num_prompt_blocks) are shared
         # with other sequences in a parallel-sampling request.
         self.prompt_blocks = prompt_blocks  # immutable
-        self.decode_blocks = []
+        self.decode_blocks: list[int] = []
 
     def append(self, new_block_id):
         self.decode_blocks.append(new_block_id)
