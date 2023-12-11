@@ -59,10 +59,8 @@ def _test(args: argparse.Namespace):
             prompts = json.load(f)["prompts"]
     else:
         prompts = [
-            # "Hello, my name is",
-            "The president of the United States is a powerful man. But he can also",
-            # "The capital of France is",
-            # "The future of AI is",
+            "The president of the United States is a powerful man. But he can also be",
+            "The future of AI is full of promise. But we need to carefully",
         ]
 
     num_sequences = 3

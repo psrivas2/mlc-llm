@@ -42,8 +42,14 @@ class KVCache:
             init_cache_func = disco_session.get_global_func(
                 "tvm.contrib.vllm.allocate_kv_cache"
             )
+            self.copy_cache_blocks_func = disco_session.get_global_func(
+                "tvm.contrib.vllm.copy_blocks"
+            )
         else:
             init_cache_func = tvm.get_global_func("tvm.contrib.vllm.allocate_kv_cache")
+            self.copy_cache_blocks_func = tvm.get_global_func(
+                "tvm.contrib.vllm.copy_blocks"
+            )
 
         self.cache = init_cache_func(
             head_size, num_layers, num_heads, block_size, num_blocks
@@ -54,6 +60,8 @@ class KVCache:
         # SequenceId -> list[int]
         self.block_tables = defaultdict(list)
         self.slot_mappings = defaultdict(list)
+
+        self.pending_copy_from_to = []
 
 
 PROMPT_SEQEUNCE_INDEX = -1
@@ -98,8 +106,6 @@ class CacheManager:
             self.block_sliding_window = sliding_window // self.kv_cache.block_size
         else:
             self.block_sliding_window = None
-
-        self.pending_copy_from_to = []
 
     def set_size(self, sequence_ids: List[SequenceId], target_sizes: List[int]):
         for id, size in zip(sequence_ids, target_sizes):
@@ -195,7 +201,6 @@ class CacheManager:
                     self.kv_cache.block_tables[prompt_seq_id]
                 )
             else:
-                assert False
                 # Tokens in the partially-shared prompt block are considered to be part of each decode sequence
                 self.allocated_decode_tokens[decode_seq_id] = (
                     num_tokens % self.block_size
@@ -208,8 +213,8 @@ class CacheManager:
                     )
                     last_block_copy = self.free_blocks.pop()
                     self.kv_cache.block_tables[decode_seq_id].append(last_block_copy)
-                    self.pending_copy_from_to.append(
-                        (self.kv_cache.block_tables[prompt_seq_id][-1], last_block_copy)
+                    self.kv_cache.pending_copy_from_to.extend(
+                        [self.kv_cache.block_tables[prompt_seq_id][-1], last_block_copy]
                     )
                 else:
                     # The last sequence can directly overwrite the last block without copying it,
@@ -697,6 +702,12 @@ class Model:
 
         torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
+
+        if is_prefill:
+            block_mapping = tvm.nd.array(np.array(cache.pending_copy_from_to, dtype="int64"))
+            assert cache.copy_cache_blocks_func
+            cache.copy_cache_blocks_func(kv_cache, block_mapping)
+            cache.pending_copy_from_to = []
 
         try:
             next_tokens = sample(logits, sampling_params, self.vocab_size)
