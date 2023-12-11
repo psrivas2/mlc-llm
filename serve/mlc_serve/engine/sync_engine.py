@@ -174,7 +174,7 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                         error=res.error,
                     )
                 )
-            else:
+            elif res.error is None:
                 valid_results.append(res)
 
         seq_outputs = defaultdict(list)

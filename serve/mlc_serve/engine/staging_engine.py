@@ -107,9 +107,6 @@ class StagingInferenceEngine(ScopedInferenceEngine):
         new_request_states = []
         for req in requests:
             # TODO: verify that request id is unique
-            if req.num_sequences > 1:
-                raise RuntimeError("num_sequences > 1 is not supported for now")
-
             # wrap the stop sequence with list if necessary
             if req.stopping_criteria.stop_sequences:
                 if isinstance(req.stopping_criteria.stop_sequences, str):
@@ -244,7 +241,7 @@ class StagingInferenceEngine(ScopedInferenceEngine):
                 prompt_len[request_id] = state.prompt_len
 
                 if seq_output.finish_reason is not None:
-                    del self.requests[request_id]
+                    gen_seq.is_finished = True
 
             for request_id, out_seqs in seq_outputs.items():
                 outputs.append(
@@ -254,6 +251,8 @@ class StagingInferenceEngine(ScopedInferenceEngine):
                         num_prompt_tokens=prompt_len[request_id],
                     )
                 )
+                if self.requests[request_id].is_finished:
+                    del self.requests[request_id]
 
         return InferenceStepResult(outputs=outputs)
 

@@ -194,6 +194,7 @@ class CacheManager:
                     prompt_seq_id
                 ]
             else:
+                assert False
                 # Tokens in the partially-shared prompt block are considered to be part of each decode sequence
                 self.allocated_decode_tokens[decode_seq_id] = (
                     num_tokens % self.block_size
@@ -605,10 +606,12 @@ class Model:
         sampling_params = []
         sequence_ids = []
         prompt_lens = []
+        num_sequences = []
 
         for request in requests:
             if isinstance(request, PrefillRequest):
                 sequence_ids.append(get_prompt_sequence_id(request.request_id))
+                num_sequences.append(request.num_sequence)
             else:
                 sequence_ids.append(request.sequence_id)
                 prompt_lens.append(request.prompt_token_counts)
@@ -701,14 +704,29 @@ class Model:
             next_tokens = sample(logits, sampling_params, self.vocab_size)
             assert next_tokens is not None
 
-            return [
-                TextGenerationResult(
-                    sequence_id=sequence_id,
-                    generated_tokens=[new_token],
-                    error=None,
-                )
-                for sequence_id, new_token in zip(sequence_ids, next_tokens)
-            ]
+            outputs = []
+            for i, (sequence_id, new_token) in enumerate(
+                zip(sequence_ids, next_tokens)
+            ):
+                if sequence_id.sequence_index == PROMPT_SEQEUNCE_INDEX:
+                    for seq_id in range(num_sequences[i]):
+                        outputs.append(
+                            TextGenerationResult(
+                                sequence_id=SequenceId(sequence_id.request_id, seq_id),
+                                generated_tokens=[new_token],
+                                error=None,
+                            )
+                        )
+                else:
+                    outputs.append(
+                        TextGenerationResult(
+                            sequence_id=sequence_id,
+                            generated_tokens=[new_token],
+                            error=None,
+                        )
+                    )
+
+            return outputs
         except RuntimeError:
             # Fallback to per-token sampling in case some logits values are corrupted.
             outputs = []
@@ -717,8 +735,8 @@ class Model:
                 " or element < 0"
             )
 
-            for sequence_id, logits_per_token, sampling_param in zip(
-                sequence_ids, torch.from_dlpack(logits), sampling_params
+            for i, (sequence_id, logits_per_token, sampling_param) in enumerate(
+                zip(sequence_ids, torch.from_dlpack(logits), sampling_params)
             ):
                 maybe_new_token = sample(
                     torch.unsqueeze(logits_per_token, 0),
@@ -728,21 +746,45 @@ class Model:
                 )
 
                 if maybe_new_token is not None:
-                    outputs.append(
-                        TextGenerationResult(
-                            sequence_id=sequence_id,
-                            generated_tokens=[maybe_new_token[0]],  # type: ignore
-                            error=None,
+                    if sequence_id.sequence_index == PROMPT_SEQEUNCE_INDEX:
+                        for seq_id in range(num_sequences[i]):
+                            outputs.append(
+                                TextGenerationResult(
+                                    sequence_id=SequenceId(
+                                        sequence_id.request_id, seq_id
+                                    ),
+                                    generated_tokens=[maybe_new_token[0]],  # type: ignore
+                                    error=None,
+                                )
+                            )
+                    else:
+                        outputs.append(
+                            TextGenerationResult(
+                                sequence_id=sequence_id,
+                                generated_tokens=[maybe_new_token[0]],  # type: ignore
+                                error=None,
+                            )
                         )
-                    )
                 else:
-                    outputs.append(
-                        TextGenerationResult(
-                            sequence_id=sequence_id,
-                            generated_tokens=[],
-                            error=err_msg,
+                    if sequence_id.sequence_index == PROMPT_SEQEUNCE_INDEX:
+                        for seq_id in range(num_sequences[i]):
+                            outputs.append(
+                                TextGenerationResult(
+                                    sequence_id=SequenceId(
+                                        sequence_id.request_id, seq_id
+                                    ),
+                                    generated_tokens=[],
+                                    error=err_msg,
+                                )
+                            )
+                    else:
+                        outputs.append(
+                            TextGenerationResult(
+                                sequence_id=sequence_id,
+                                generated_tokens=[],
+                                error=err_msg,
+                            )
                         )
-                    )
 
             return outputs
 
