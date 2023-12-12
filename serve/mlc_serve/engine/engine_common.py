@@ -303,11 +303,11 @@ class EngineBase:
             or (kv_cache_size - prompt_len) < self.max_decode_steps * num_sequences
         )
 
-    def evict_request(self, cancell_callback: Callable[[RequestId, int], None]) -> int:
+    def evict_request(self, cancell_callback: Callable[[RequestId], None]) -> int:
         # Must be called with the queue lock held
         num_eviction = 0
 
-        while self.cache_manager.get_max_new_tokens() < 19000:
+        while self.cache_manager.get_max_new_tokens() < 1:
             num_eviction += 1
             request_to_remove = min(
                 self.current_batch.values(), key=lambda s: s.num_total_tokens
@@ -319,15 +319,15 @@ class EngineBase:
 
             # TODO(masahi): Properly support evicting a multi-sequence request
             if num_sequences != 1:
-                cancell_callback(request_to_remove.request_id, num_sequences)
+                cancell_callback(request_to_remove.request_id)
                 continue
-            else:
-                self.queue.appendleft(request_to_remove)
 
-                LOG.debug(
-                    "Preempt request to free %s tokens",
-                    request_to_remove.num_total_tokens,
-                )
+            self.queue.appendleft(request_to_remove)
+
+            LOG.debug(
+                "Preempt request to free %s tokens",
+                request_to_remove.num_total_tokens,
+            )
 
         return num_eviction
 

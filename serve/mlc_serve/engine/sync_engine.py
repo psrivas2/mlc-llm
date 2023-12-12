@@ -4,7 +4,7 @@ A implementation of InferenceEngine that executes in the current process.
 
 import logging
 from collections import defaultdict
-from typing import Set, Tuple
+from typing import Set, Dict
 
 from .base import (
     FinishReason,
@@ -37,14 +37,16 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
     """
 
     # ID and num_sequences for canceled requests
-    requests_to_be_cancelled: Set[Tuple[RequestId, int]]
+    requests_to_be_cancelled: Set[RequestId]
+    num_sequences_per_requests: Dict[RequestId, int]
 
     def __init__(
         self,
         model_module: ModelModule,
     ):
         EngineBase.__init__(self, model_module)
-        self.requests_to_be_cancelled = set[Tuple[RequestId, int]]()
+        self.requests_to_be_cancelled = set[RequestId]()
+        self.num_sequences_per_requests = dict[RequestId, int]()
 
     def add(self, requests: list[Request]):
         if not requests:
@@ -65,11 +67,12 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                 req, self.conversation_template, self.tokenizer
             )
             new_request_states.append(state)
+            self.num_sequences_per_requests[state.request_id] = state.num_sequences
 
             if state.validation_err is not None or self.check_prompt_too_long(
                 state.prompt_len, state.num_sequences
             ):
-                self.cancel(req.request_id, req.num_sequences)
+                self.cancel(req.request_id)
                 if state.validation_err is None:
                     state.validation_err = ValidationError(
                         "The prompt is too long for the given set of engine parameters."
@@ -79,12 +82,12 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
             self.queue.extend(new_request_states)
             self.has_new_requests.notify_all()
 
-    def cancel(self, request_id: RequestId, num_sequences: int):
+    def cancel(self, request_id: RequestId):
         with self.queue_lock:
             # TODO: consider iterating throught the queue to find if request id exist
             # Otherwise cancel a request that's already finished will leave request_id
             # in the `requests_to_be_cancelled` set forever.
-            self.requests_to_be_cancelled.add((request_id, num_sequences))
+            self.requests_to_be_cancelled.add(request_id)
 
     def wait_for_request(self, timeout_seconds=None) -> bool:
         with self.queue_lock:
@@ -122,6 +125,7 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                 )
                 self.current_batch.pop(state.request_id)
                 self.cache_manager.free_request(state)
+                del self.num_sequences_per_requests[state.request_id]
 
         previous_requests_to_be_cancelled = set(self.requests_to_be_cancelled)
         self._adjust_batch()
@@ -134,19 +138,20 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                     " the execution of SyncEngine._adjust_batch"
                 )
 
-        for request_id, num_sequences in previous_requests_to_be_cancelled:
+        for request_id in previous_requests_to_be_cancelled:
             if request_id not in self.requests_to_be_cancelled:
                 outputs.append(
                     RequestOutput(
                         request_id=request_id,
                         sequences=[
                             SequenceOutput(i, finish_reason=FinishReason.Cancelled)
-                            for i in range(num_sequences)
+                            for i in range(self.num_sequences_per_requests[request_id])
                         ],
                     )
                 )
+                del self.num_sequences_per_requests[request_id]
 
-        for request_id, num_sequences in list(self.requests_to_be_cancelled):
+        for request_id in list(self.requests_to_be_cancelled):
             if request_id not in previous_requests_to_be_cancelled:
                 # This is for requests canceled during _adjust_batch()
                 outputs.append(
@@ -154,11 +159,12 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                         request_id=request_id,
                         sequences=[
                             SequenceOutput(i, finish_reason=FinishReason.Cancelled)
-                            for i in range(num_sequences)
+                            for i in range(self.num_sequences_per_requests[request_id])
                         ],
                     )
                 )
-                self.requests_to_be_cancelled.remove((request_id, num_sequences))
+                self.requests_to_be_cancelled.remove(request_id)
+                del self.num_sequences_per_requests[request_id]
 
         if not self.current_batch:
             return InferenceStepResult(outputs)
@@ -192,6 +198,11 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
 
         for res in valid_results:
             request_id = res.sequence_id.request_id
+
+            if request_id in failed_requests:
+                # Other sequence in the same request has errored.
+                continue
+
             seq_index = res.sequence_id.sequence_index
             state = self.current_batch[request_id]
             gen_seq = state.generation_sequences[seq_index]
@@ -245,8 +256,8 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
                     self.requests_to_be_cancelled.remove(request_id)
 
             self.evict_request(
-                cancell_callback=lambda request_id, num_seqs: self.requests_to_be_cancelled.add(
-                    (request_id, num_seqs)
+                cancell_callback=lambda request_id: self.requests_to_be_cancelled.add(
+                    request_id
                 )
             )
 
@@ -274,6 +285,4 @@ class SynchronousInferenceEngine(InferenceEngine, EngineBase):
         """
         while self.queue and self.queue[0].request_id in self.requests_to_be_cancelled:
             state = self.queue.popleft()
-            self.requests_to_be_cancelled.remove(
-                (state.request_id, state.num_sequences)
-            )
+            self.requests_to_be_cancelled.remove(state.request_id)

@@ -138,7 +138,7 @@ class KVCache:
         self.slot_mappings = defaultdict(list)
 
         # The core data structure
-        self.decode_block_tables: Dict[SequenceId, DecodeBlockTable] = dict()
+        self.decode_block_tables = dict[SequenceId, DecodeBlockTable]()
 
         # Record indices of blocks to copy after prefill in the format [src1, dst1, src2, dst2, ...]
         self.pending_copy_from_to: list[int] = []
