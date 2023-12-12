@@ -3,7 +3,7 @@ Common utilites for engine classes.
 """
 
 import time
-from typing import Tuple, Deque, Dict, Optional, Union
+from typing import Tuple, Deque, Dict, Optional, Union, Callable
 from collections import deque
 from threading import Condition, Lock
 
@@ -303,30 +303,36 @@ class EngineBase:
             or (kv_cache_size - prompt_len) < self.max_decode_steps * num_sequences
         )
 
-    def evict_request(self) -> int:
+    def evict_request(self, cancell_callback: Callable[[RequestId, int], None]) -> int:
+        # Must be called with the queue lock held
         num_eviction = 0
 
-        while self.cache_manager.get_max_new_tokens() < 1:
+        while self.cache_manager.get_max_new_tokens() < 19000:
             num_eviction += 1
             request_to_remove = min(
                 self.current_batch.values(), key=lambda s: s.num_total_tokens
             )
-            # TODO parallel sampling: Properly support evicting a multi-sequence request
-            assert (
-                self.current_batch[request_to_remove.request_id].num_sequences == 1
-            ), "Evicting a multi-sequence request is not supported."
-
+            num_sequences = self.current_batch[
+                request_to_remove.request_id
+            ].num_sequences
             self.remove_request_from_batch(request_to_remove.request_id)
-            self.queue.appendleft(request_to_remove)
 
-            LOG.debug(
-                "Preempt request to free %s tokens",
-                request_to_remove.num_total_tokens,
-            )
+            # TODO(masahi): Properly support evicting a multi-sequence request
+            if num_sequences != 1:
+                cancell_callback(request_to_remove.request_id, num_sequences)
+                continue
+            else:
+                self.queue.appendleft(request_to_remove)
+
+                LOG.debug(
+                    "Preempt request to free %s tokens",
+                    request_to_remove.num_total_tokens,
+                )
 
         return num_eviction
 
     def try_grow_batch(self, num_new_batched_tokens) -> Optional[int]:
+        # Must be called with the queue lock held
         max_new_tokens = self.cache_manager.get_max_new_tokens()
         if max_new_tokens < self.min_decode_steps:
             LOG.debug(

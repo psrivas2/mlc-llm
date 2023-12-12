@@ -73,7 +73,7 @@ class DecodeBlockTable:
     def __len__(self):
         return self.num_prompt_blocks + len(self.decode_blocks)
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index: int) -> int:
         if index == -1:
             if len(self.decode_blocks) == 0:
                 return self.prompt_blocks[-1]
@@ -87,7 +87,7 @@ class DecodeBlockTable:
 
         return self.decode_blocks[index - self.num_prompt_blocks]
 
-    def get_blocks(self):
+    def get_blocks(self) -> list[int]:
         if not self.block_sliding_window or not self.prompt_shared:
             return self.prompt_blocks + self.decode_blocks
 
@@ -198,7 +198,8 @@ class CacheManager:
                     )
                     del self.kv_cache.decode_block_tables[id]
 
-                del self.kv_cache.slot_mappings[id]
+                if id in self.kv_cache.slot_mappings:
+                    del self.kv_cache.slot_mappings[id]
 
             elif id in self.kv_cache.decode_block_tables:
                 decode_block_table = self.kv_cache.decode_block_tables[id]

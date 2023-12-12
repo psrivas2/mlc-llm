@@ -35,7 +35,10 @@ class AsyncEngineConnector:
         """
         Needs to be called in the thread with event loop
         """
-        LOG.info("Starting AsyncEngineConnector.", engine_wait_timeout=self.engine_wait_timeout)
+        LOG.info(
+            "Starting AsyncEngineConnector.",
+            engine_wait_timeout=self.engine_wait_timeout,
+        )
         if self.engine_loop_task is not None:
             return
 
@@ -88,7 +91,9 @@ class AsyncEngineConnector:
                 if output.is_finished:
                     return
         except asyncio.CancelledError:
-            await asyncio.to_thread(self.engine.cancel, request.request_id)
+            await asyncio.to_thread(
+                self.engine.cancel, (request.request_id, request.num_sequences)
+            )
         finally:
             self.result_queues.pop(request.request_id, None)
 
@@ -132,9 +137,7 @@ class AsyncEngineConnector:
         for item in result.outputs:
             request_id = item.request_id
             if request_id not in self.result_queues:
-                LOG.warn(
-                    f"Unknown request id when dispatching result: {request_id}"
-                )
+                LOG.warn(f"Unknown request id when dispatching result: {request_id}")
                 continue
 
             queue = self.result_queues[request_id]

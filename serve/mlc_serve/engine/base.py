@@ -203,7 +203,7 @@ class InferenceEngine(ABC):
         ...
 
     @abstractmethod
-    def cancel(self, request_id: RequestId) -> None:
+    def cancel(self, request_id: RequestId, num_sequences: int = 1) -> None:
         """
         Cancel the generation of a request.
 
