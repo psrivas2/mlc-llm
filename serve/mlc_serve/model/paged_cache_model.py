@@ -22,6 +22,8 @@ from ..engine import (
     SamplingParams,
     SequenceId,
     RequestState,
+    PROMPT_SEQEUNCE_INDEX,
+    get_prompt_sequence_id,
 )
 from ..engine.model_module import (
     DecodeRequest,
@@ -140,13 +142,6 @@ class KVCache:
 
         # Record indices of blocks to copy after prefill in the format [src1, dst1, src2, dst2, ...]
         self.pending_copy_from_to: list[int] = []
-
-
-PROMPT_SEQEUNCE_INDEX = -1
-
-
-def get_prompt_sequence_id(request_id: RequestId) -> SequenceId:
-    return SequenceId(request_id, PROMPT_SEQEUNCE_INDEX)
 
 
 class CacheManager:
