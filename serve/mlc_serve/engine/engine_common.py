@@ -312,16 +312,18 @@ class EngineBase:
             request_to_remove = min(
                 self.current_batch.values(), key=lambda s: s.num_total_tokens
             )
-            num_sequences = self.current_batch[
-                request_to_remove.request_id
-            ].num_sequences
-            self.remove_request_from_batch(request_to_remove.request_id)
 
             # TODO(masahi): Properly support evicting a multi-sequence request
-            if num_sequences != 1:
+            if self.current_batch[request_to_remove.request_id].num_sequences != 1:
                 cancell_callback(request_to_remove.request_id)
+                self.remove_request_from_batch(request_to_remove.request_id)
+                LOG.warn(
+                    "Preempting a multi-sequence request is currently not supported,"
+                    f" cancelling request '{request_to_remove.request_id}'",
+                )
                 continue
 
+            self.remove_request_from_batch(request_to_remove.request_id)
             self.queue.appendleft(request_to_remove)
 
             LOG.debug(
