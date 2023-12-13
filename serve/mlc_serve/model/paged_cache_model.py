@@ -104,10 +104,16 @@ class DecodeBlockTable:
         )
 
     def replace_head_prompt_block_with(self, new_block):
+        assert self.prompt_shared
+
         self.append(new_block)
         self.prompt_cursor += 1
         self.prompt_cursor %= self.num_prompt_blocks
         self.num_prompt_blocks -= 1
+
+        if self.prompt_cursor == self.prompt_cursor_tail:
+            # No more prompt blocks to be shared
+            self.prompt_shared = False
 
 
 class KVCache:
