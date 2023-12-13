@@ -35,6 +35,16 @@ from ..engine.model_module import ModelModule
 LOG = structlog.stdlib.get_logger(__name__)
 
 
+# The following implementation has become complicated mostly to support parallel sampling and
+# SWA. vLLM uses more redundant representaion of block tables (prompt blocks are duplicated
+# among all sequences, and circular buffering is realized by appending a block at index
+# (pos // block_size) % block_sliding_window to the end of the block table list), but thanks
+# to that parallel sampling with SWA was automatically supported when they introduced
+# Mistral / SWA support.
+#
+# TODO(masahi): Consider adopting their representation if ours turns out to be too buggy (hopefully not)
+
+
 class DecodeBlockTable:
     def __init__(
         self,
