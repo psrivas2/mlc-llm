@@ -145,11 +145,12 @@ class Request:
                 f"got n={self.num_sequences} and best_of={self.best_of}."
             )
         if (
-            self.best_of > 1
+            self.best_of > self.num_sequences
             and self.sampling_params.sampling_type == SamplingType.GREEDY
         ):
             raise ValueError(
-                "best_of must be 1 when using greedy sampling." f"Got {self.best_of}."
+                "best_of must be equal to num_sequences when using greedy sampling, "
+                + f"but self.best_of={self.best_of}, and self.num_sequences={self.num_sequences}"
             )
 
 
